@@ -20,8 +20,8 @@ class StageConfig:
         kind = str(raw.get("kind", "")).strip()
         if not stage_id:
             raise ValueError("stage.id is required")
-        if kind not in {"codex", "shell", "manual"}:
-            raise ValueError("stage.kind must be one of: codex, shell, manual")
+        if kind not in {"codex", "shell", "manual", "crewai"}:
+            raise ValueError("stage.kind must be one of: codex, shell, manual, crewai")
         commands = raw.get("commands", [])
         if commands is None:
             commands = []

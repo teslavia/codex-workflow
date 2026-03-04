@@ -1,7 +1,7 @@
 # Codex Workflow Kit
 
 可复用的 Codex 辅助编码编排骨架，目标是：
-- 在任意项目快速建立 `plan -> implement -> verify -> review` 流程
+- 在任意项目快速建立 `crewai orchestration -> verify` 流程
 - 自动沉淀失败类型和稳定规则，持续优化下一轮执行质量
 - 不污染主项目依赖（默认零依赖，CrewAI 为可选依赖）
 
@@ -11,7 +11,7 @@
 - `codex_workflow/runner.py`: 执行工作流并落盘 run 报告
 - `codex_workflow/evolution.py`: 汇总历史运行，更新 playbook
 - `codex_workflow/hooks.py`: 安装/管理 `pre-push` hook
-- `codex_workflow/crewai_blueprint.py`: 可选 CrewAI 骨架
+- `codex_workflow/crewai_blueprint.py`: CrewAI 角色蓝图
 
 ## 安装
 
@@ -21,7 +21,7 @@
 python3 -m pip install -e .
 ```
 
-如果你要启用 CrewAI 示例：
+启用默认 CrewAI 模式（推荐 Python 3.10-3.13）：
 
 ```bash
 python3 -m pip install -e '.[crewai]'
@@ -33,7 +33,7 @@ python3 -m pip install -e '.[crewai]'
 codex-workflow bootstrap --target /path/to/repo --project-name your_repo
 ```
 
-## 执行工作流
+## 执行工作流（默认 CrewAI）
 
 先 dry-run 检查配置：
 
@@ -41,13 +41,17 @@ codex-workflow bootstrap --target /path/to/repo --project-name your_repo
 codex-workflow run --target /path/to/repo --goal "修复 xxx 并补测试" --dry-run
 ```
 
-正式执行：
+正式执行（默认会先跑 CrewAI 再跑 verify 门禁）：
 
 ```bash
-codex-workflow run --target /path/to/repo --goal "修复 xxx 并补测试" --enable-codex
+codex-workflow run --target /path/to/repo --goal "修复 xxx 并补测试"
 ```
 
-注意：`codex` 命令参数在不同版本 CLI 可能不同，请按本机 CLI 调整 `.codex-workflow/workflow.json` 中 `codex.command`。
+默认模板角色为：`planner -> coder -> tester -> reviewer`。
+默认会自动读取 `~/.codex/config.toml` 与 `~/.codex/auth.json` 作为 LLM 配置来源，
+并设置运行时 `OPENAI_API_KEY/OPENAI_BASE_URL/OPENAI_MODEL_NAME`。
+
+如果你想自定义为 Codex/shell/manual 流程，直接修改 `.codex-workflow/workflow.json` 的 `stages`。
 
 ## 自进化
 

@@ -4,10 +4,13 @@
 
 ## 核心配置（建议长期维护）
 
-- `workflow.json`: 阶段定义与 Codex 执行命令
+- `workflow.json`: 阶段定义（默认 `crewai -> verify`）
 - `project_profile.json`: 项目画像和硬约束
 - `quality_gates.json`: 构建/测试门禁
 - `evolution.json`: 经验沉淀策略参数
+
+默认 `workflow.json` 的 `crew_orchestrate` 阶段为 CrewAI，
+并自动读取 `~/.codex/config.toml` 与 `~/.codex/auth.json` 作为 LLM 运行时配置。
 
 默认 `workflow.json` 的 `verify` 阶段使用 `command_source: quality_gates.required`，
 即由 `quality_gates.json` 驱动实际验证命令。

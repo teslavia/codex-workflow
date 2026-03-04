@@ -58,26 +58,15 @@ def _default_workflow() -> Dict[str, object]:
         },
         "stages": [
             {
-                "id": "plan",
-                "kind": "codex",
-                "description": "Create implementation plan with risk and test strategy",
+                "id": "crew_orchestrate",
+                "kind": "crewai",
+                "description": "Default CrewAI orchestration (planner/coder/tester/reviewer)",
                 "prompt_template": (
-                    "你是资深工程师。目标: {{goal}}\n"
+                    "任务目标: {{goal}}\n"
                     "项目画像: {{project_profile}}\n"
-                    "最近经验: {{recent_lessons}}\n"
-                    "输出: 1)最小改动方案 2)风险点 3)验证命令"
-                ),
-            },
-            {
-                "id": "implement",
-                "kind": "codex",
-                "description": "Implement minimal diff that satisfies the goal",
-                "prompt_template": (
-                    "执行目标: {{goal}}\n"
-                    "约束: 最小改动、避免无关重构、保持代码风格一致\n"
                     "质量门禁: {{quality_gates}}\n"
-                    "最近经验: {{recent_lessons}}\n"
-                    "请完成编码并自检。"
+                    "近期经验: {{recent_lessons}}\n"
+                    "输出要求: 先给最小变更方案，再给执行与验证结论。"
                 ),
             },
             {
@@ -86,16 +75,6 @@ def _default_workflow() -> Dict[str, object]:
                 "description": "Run required quality gates",
                 "command_source": "quality_gates.required",
                 "commands": [],
-            },
-            {
-                "id": "review",
-                "kind": "codex",
-                "description": "Perform regression and quality review",
-                "prompt_template": (
-                    "审查本次任务: {{goal}}\n"
-                    "请输出: 1)风险清单(按严重度) 2)测试缺口 3)是否可合并\n"
-                    "质量门禁: {{quality_gates}}"
-                ),
             },
         ],
     }

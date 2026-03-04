@@ -67,6 +67,26 @@ def _run_shell_command(command: str, cwd: Path, log_path: Path) -> int:
     return int(completed.returncode)
 
 
+def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
+    try:
+        from .crewai_blueprint import build_default_crew, resolve_codex_llm_runtime
+
+        runtime = resolve_codex_llm_runtime(apply_env=False)
+        crew = build_default_crew(goal=goal_text)
+        result = crew.kickoff()
+        log_path.write_text(
+            "[crewai_runtime]\n"
+            f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
+            "[crewai_result]\n"
+            f"{result}\n",
+            encoding="utf-8",
+        )
+        return 0
+    except Exception as exc:  # pragma: no cover - external dependency/runtime config
+        log_path.write_text(f"[crewai_error]\n{exc}\n", encoding="utf-8")
+        return 1
+
+
 def _commands_from_quality_gates(quality_gates: Dict[str, object], section: str) -> List[str]:
     raw_items = quality_gates.get(section, [])
     if not isinstance(raw_items, list):
@@ -159,6 +179,28 @@ def run_workflow(
                     stage_message = f"command failed: {cmd}"
                     if not stage.continue_on_error:
                         break
+
+        elif stage.kind == "crewai":
+            crew_goal = _render_template(stage.prompt_template or "{{goal}}", context)
+            log_path = run_dir / f"{stage.stage_id}.crewai.log"
+            prompt_path.write_text(crew_goal + "\n", encoding="utf-8")
+            if dry_run:
+                return_code = 0
+                log_path.write_text(f"[dry-run] crewai goal: {crew_goal}\n", encoding="utf-8")
+            else:
+                return_code = _run_crewai_stage(crew_goal, log_path)
+
+            command_results.append(
+                CommandResult(
+                    command="crewai kickoff",
+                    return_code=return_code,
+                    log_path=str(log_path),
+                )
+            )
+            if return_code != 0:
+                stage_status = "failed"
+                run_status = "failed"
+                stage_message = "crewai stage failed"
 
         elif stage.kind == "codex":
             prompt = _render_template(stage.prompt_template, context)

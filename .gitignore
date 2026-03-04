@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
 .DS_Store
+._*
+
+.venv/
+codex_workflow.egg-info/
+crew_pipeline_example.py
+
 .codex-workflow/runs/
 .codex-workflow/*.lock
-
-._*
