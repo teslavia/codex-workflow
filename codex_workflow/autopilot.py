@@ -44,7 +44,10 @@ def _recommended_quality_gates(repo_root: Path) -> Dict[str, object]:
             "required": [
                 {
                     "name": "py_compile",
-                    "command": "python3 -m compileall -q -x '(^|/)(\\.venv|\\.git|build|dist|__pycache__)(/|$)' .",
+                    "command": (
+                        "python3 -m compileall -q "
+                        "-x '(^|/)(\\.venv[^/]*|\\.git|build|dist|__pycache__|\\._[^/]*)(/|$)' ."
+                    ),
                 }
             ],
             "optional": [{"name": "pytest", "command": "python3 -m pytest -q"}],
@@ -529,6 +532,7 @@ def _build_campaign_metrics(
     totals = {
         "runs": 0,
         "success_runs": 0,
+        "strict_success_runs": 0,
         "failed_runs": 0,
         "degraded_stage_runs": 0,
     }
@@ -546,6 +550,7 @@ def _build_campaign_metrics(
 
         stages = report.get("stages", [])
         degraded_in_run = False
+        strict_success_in_run = True
         if isinstance(stages, list):
             for stage in stages:
                 if not isinstance(stage, dict):
@@ -570,6 +575,8 @@ def _build_campaign_metrics(
                 stage_time[stage_id] = stage_time.get(stage_id, 0.0) + elapsed
                 if status == "degraded":
                     degraded_in_run = True
+                if status in {"failed", "degraded", "manual"}:
+                    strict_success_in_run = False
 
                 cmd_results = stage.get("command_results", [])
                 if isinstance(cmd_results, list):
@@ -581,6 +588,8 @@ def _build_campaign_metrics(
 
         if degraded_in_run:
             totals["degraded_stage_runs"] += 1
+        if strict_success_in_run:
+            totals["strict_success_runs"] += 1
 
     avg_stage_seconds: Dict[str, float] = {}
     for stage_id, total_elapsed in stage_time.items():
@@ -599,6 +608,7 @@ def _build_campaign_metrics(
                     blocked_models.append(str(name))
 
     success_rate = (totals["success_runs"] / totals["runs"]) if totals["runs"] else 0.0
+    strict_success_rate = (totals["strict_success_runs"] / totals["runs"]) if totals["runs"] else 0.0
     degraded_rate = (totals["degraded_stage_runs"] / totals["runs"]) if totals["runs"] else 0.0
     timeout_rate = (codex_timeout_count / totals["runs"]) if totals["runs"] else 0.0
     quality_score = _compute_campaign_quality_score(success_rate, degraded_rate, timeout_rate)
@@ -608,8 +618,10 @@ def _build_campaign_metrics(
         "campaign_id": campaign_id,
         "runs": totals["runs"],
         "success_runs": totals["success_runs"],
+        "strict_success_runs": totals["strict_success_runs"],
         "failed_runs": totals["failed_runs"],
         "success_rate": success_rate,
+        "strict_success_rate": strict_success_rate,
         "degraded_run_rate": degraded_rate,
         "codex_timeout_count": codex_timeout_count,
         "timeout_rate": timeout_rate,
@@ -651,6 +663,37 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
             timeout_rate=_timeout_rate(payload),
         )
 
+    def _strict_success_runs(payload: Dict[str, object]) -> int:
+        if "strict_success_runs" in payload:
+            try:
+                return int(payload.get("strict_success_runs", 0))
+            except Exception:
+                return 0
+        try:
+            runs = int(payload.get("runs", 0))
+        except Exception:
+            runs = 0
+        if runs <= 0:
+            return 0
+        if "strict_success_rate" in payload:
+            rate = _num(payload.get("strict_success_rate", 0.0))
+            return max(0, min(runs, int(round(max(0.0, min(1.0, rate)) * runs))))
+        success_rate = _num(payload.get("success_rate", 0.0))
+        degraded_rate = _num(payload.get("degraded_run_rate", 0.0))
+        estimated_rate = max(0.0, min(1.0, success_rate - degraded_rate))
+        return max(0, min(runs, int(round(estimated_rate * runs))))
+
+    def _strict_success_rate(payload: Dict[str, object]) -> float:
+        if "strict_success_rate" in payload:
+            return _num(payload.get("strict_success_rate", 0.0))
+        try:
+            runs = int(payload.get("runs", 0))
+        except Exception:
+            runs = 0
+        if runs <= 0:
+            return 0.0
+        return _strict_success_runs(payload) / runs
+
     stage_delta: Dict[str, Dict[str, int]] = {}
     current_stage = current.get("stage_health", {})
     prev_stage = previous.get("stage_health", {})
@@ -683,8 +726,10 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
         "delta": {
             "runs": int(_num(current.get("runs", 0)) - _num(previous.get("runs", 0))),
             "success_runs": int(_num(current.get("success_runs", 0)) - _num(previous.get("success_runs", 0))),
+            "strict_success_runs": _strict_success_runs(current) - _strict_success_runs(previous),
             "failed_runs": int(_num(current.get("failed_runs", 0)) - _num(previous.get("failed_runs", 0))),
             "success_rate": _num(current.get("success_rate", 0.0)) - _num(previous.get("success_rate", 0.0)),
+            "strict_success_rate": _strict_success_rate(current) - _strict_success_rate(previous),
             "degraded_run_rate": _num(current.get("degraded_run_rate", 0.0)) - _num(previous.get("degraded_run_rate", 0.0)),
             "timeout_rate": _timeout_rate(current) - _timeout_rate(previous),
             "codex_timeout_count": int(
@@ -990,6 +1035,10 @@ def iterate_goal(
 
     metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports)
     dump_json(metrics_path, metrics)
+    summary["strict_success_count"] = int(metrics.get("strict_success_runs", 0) or 0)
+    summary["strict_success_rate"] = float(metrics.get("strict_success_rate", 0.0) or 0.0)
+    dump_json(summary_path, summary)
+
     history_records = _load_jsonl_records(metrics_history_path)
     append_jsonl(metrics_history_path, metrics)
 
