@@ -47,29 +47,49 @@ def _render_template(template: str, context: Dict[str, str]) -> str:
     return rendered
 
 
-def _run_shell_command(command: str, cwd: Path, log_path: Path) -> int:
-    completed = subprocess.run(  # nosec B602
-        command,
-        cwd=str(cwd),
-        shell=True,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _run_shell_command(command: str, cwd: Path, log_path: Path, timeout_seconds: int | None = None) -> int:
+    timed_out = False
+    try:
+        completed = subprocess.run(  # nosec B602
+            command,
+            cwd=str(cwd),
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        stdout_text = completed.stdout or ""
+        stderr_text = completed.stderr or ""
+        return_code = int(completed.returncode)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout_text = exc.stdout or ""
+        stderr_text = exc.stderr or ""
+        return_code = 124
+
+        if isinstance(stdout_text, bytes):
+            stdout_text = stdout_text.decode("utf-8", errors="replace")
+        if isinstance(stderr_text, bytes):
+            stderr_text = stderr_text.decode("utf-8", errors="replace")
+
     with log_path.open("w", encoding="utf-8") as f:
         f.write(f"$ {command}\n\n")
-        if completed.stdout:
+        if stdout_text:
             f.write("[stdout]\n")
-            f.write(completed.stdout)
-            if not completed.stdout.endswith("\n"):
+            f.write(stdout_text)
+            if not stdout_text.endswith("\n"):
                 f.write("\n")
-        if completed.stderr:
+        if stderr_text:
             f.write("\n[stderr]\n")
-            f.write(completed.stderr)
-            if not completed.stderr.endswith("\n"):
+            f.write(stderr_text)
+            if not stderr_text.endswith("\n"):
                 f.write("\n")
-        f.write(f"\n[return_code] {completed.returncode}\n")
-    return int(completed.returncode)
+        if timed_out:
+            f.write(f"\n[timeout_seconds] {timeout_seconds}\n")
+            f.write("[timeout] command exceeded time limit and was terminated\n")
+        f.write(f"\n[return_code] {return_code}\n")
+    return return_code
 
 
 def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
@@ -243,7 +263,16 @@ def run_workflow(
                     return_code = 0
                     log_path.write_text(f"[dry-run] $ {codex_cmd}\n", encoding="utf-8")
                 else:
-                    return_code = _run_shell_command(codex_cmd, Path(codex_cwd), log_path)
+                    try:
+                        codex_timeout = int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180"))
+                    except ValueError:
+                        codex_timeout = 180
+                    return_code = _run_shell_command(
+                        codex_cmd,
+                        Path(codex_cwd),
+                        log_path,
+                        timeout_seconds=max(30, codex_timeout),
+                    )
 
                 command_results.append(
                     CommandResult(
