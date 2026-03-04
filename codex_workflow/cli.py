@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .autopilot import iterate_goal
 from .bootstrap import bootstrap
 from .crewai_blueprint import write_example_script
 from .evolution import evolve
@@ -34,6 +35,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     report = load_json(report_path)
     print(f"Run report: {report_path}")
     return 0 if report.get("status") == "success" else 1
+
+
+def _cmd_iterate(args: argparse.Namespace) -> int:
+    summary_path = iterate_goal(
+        repo_root=Path(args.target).resolve(),
+        goal=args.goal,
+        iterations=int(args.iterations),
+        dry_run=bool(args.dry_run),
+        enable_codex=bool(args.enable_codex),
+        project_name=args.project_name,
+        until_success=bool(args.until_success),
+        min_iterations=int(args.min_iterations),
+    )
+    summary = load_json(summary_path)
+    print(f"Autopilot summary: {summary_path}")
+    print(
+        "iterations_completed="
+        f"{summary.get('iterations_completed')} success_rate={summary.get('success_rate')}"
+    )
+    if bool(args.until_success):
+        return 0 if int(summary.get("success_count", 0)) > 0 else 1
+    return 0
 
 
 def _cmd_evolve(args: argparse.Namespace) -> int:
@@ -85,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--enable-codex", action="store_true", help="Execute codex stages")
     p_run.add_argument("--no-evolve", action="store_true", help="Skip post-run evolution")
     p_run.set_defaults(func=_cmd_run)
+
+    p_iter = sub.add_parser("iterate", help="Autopilot loop: run/evolve/improve in multiple iterations")
+    p_iter.add_argument("--target", default=".", help="Project root path")
+    p_iter.add_argument("--goal", required=True, help="Single goal for autonomous iteration")
+    p_iter.add_argument("--iterations", type=int, default=100, help="Maximum iteration count")
+    p_iter.add_argument("--min-iterations", type=int, default=1, help="Minimum iterations before early-stop")
+    p_iter.add_argument("--until-success", action="store_true", help="Stop early after success (>= min-iterations)")
+    p_iter.add_argument("--dry-run", action="store_true", help="Run each iteration in dry-run mode")
+    p_iter.add_argument("--enable-codex", action="store_true", help="Enable codex stage if workflow contains it")
+    p_iter.add_argument("--project-name", default="project", help="Project name used when auto-bootstrap is needed")
+    p_iter.set_defaults(func=_cmd_iterate)
 
     p_evolve = sub.add_parser("evolve", help="Summarize runs and update playbook")
     p_evolve.add_argument("--target", default=".", help="Project root path")

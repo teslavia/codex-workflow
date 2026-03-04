@@ -16,7 +16,8 @@ def _utc_now() -> datetime:
 
 
 def _run_id() -> str:
-    return _utc_now().strftime("%Y%m%dT%H%M%SZ")
+    # Microsecond precision avoids run-id collisions in high-frequency iteration loops.
+    return _utc_now().strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _read_recent_lessons(path: Path, limit: int = 6) -> List[Dict[str, object]]:
