@@ -146,6 +146,31 @@ def _ensure_verify_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object]
     return workflow, actions
 
 
+def _normalize_codex_runtime(workflow: Dict[str, object]) -> Tuple[Dict[str, object], List[str]]:
+    actions: List[str] = []
+    codex_cfg = workflow.get("codex")
+    if not isinstance(codex_cfg, dict):
+        codex_cfg = {}
+        workflow["codex"] = codex_cfg
+        actions.append("inserted missing codex runtime config")
+
+    command = codex_cfg.get("command")
+    target_cmd = "codex exec --skip-git-repo-check - < {prompt_file}"
+    if not isinstance(command, str) or not command.strip():
+        codex_cfg["command"] = target_cmd
+        actions.append("set default codex.command for stdin prompt mode")
+    elif "--prompt-file" in command or "codex exec - < {prompt_file}" in command:
+        codex_cfg["command"] = target_cmd
+        actions.append("migrated legacy codex.command to stdin mode with skip-git-repo-check")
+
+    cwd = codex_cfg.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        codex_cfg["cwd"] = "{repo_root}"
+        actions.append("set default codex.cwd")
+
+    return workflow, actions
+
+
 def _normalize_workflow_structure(repo_root: Path) -> List[str]:
     wf_root = repo_root / ".codex-workflow"
     workflow_path = wf_root / "workflow.json"
@@ -153,6 +178,8 @@ def _normalize_workflow_structure(repo_root: Path) -> List[str]:
     workflow, actions = _ensure_crewai_stage(workflow)
     workflow, verify_actions = _ensure_verify_stage(workflow)
     actions.extend(verify_actions)
+    workflow, codex_actions = _normalize_codex_runtime(workflow)
+    actions.extend(codex_actions)
     if actions:
         dump_json(workflow_path, workflow)
     return actions
@@ -164,9 +191,15 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
 
     workflow_path = wf_root / "workflow.json"
     workflow = load_json(workflow_path)
+    codex_cfg = workflow.get("codex", {})
+    if not isinstance(codex_cfg, dict):
+        codex_cfg = {}
+        workflow["codex"] = codex_cfg
     workflow, stage_actions = _ensure_crewai_stage(workflow)
     workflow, verify_actions = _ensure_verify_stage(workflow)
     stage_actions.extend(verify_actions)
+    workflow, codex_actions = _normalize_codex_runtime(workflow)
+    stage_actions.extend(codex_actions)
     actions.extend(stage_actions)
 
     evo_path = wf_root / "evolution.json"
@@ -180,46 +213,53 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
         evo["lookback_runs"] = min(300, int(evo.get("lookback_runs", 30)) + 5)
         actions.append("increased evolution lookback and lesson window after stable streak")
 
-    if status != "success":
-        stages = report.get("stages", [])
-        if isinstance(stages, list):
-            for stage in stages:
+    stages = report.get("stages", [])
+    crew_degraded = False
+    if isinstance(stages, list):
+        for stage in stages:
+            if (
+                isinstance(stage, dict)
+                and stage.get("kind") == "crewai"
+                and stage.get("status") in {"failed", "degraded"}
+            ):
+                crew_degraded = True
+                break
+
+    if crew_degraded:
+        wf_stages = workflow.get("stages", [])
+        if isinstance(wf_stages, list):
+            crew_idx = -1
+            for idx, item in enumerate(wf_stages):
+                if isinstance(item, dict) and item.get("id") == "crew_orchestrate":
+                    crew_idx = idx
+                    break
+            has_codex_fallback = any(
+                isinstance(item, dict) and str(item.get("id", "")).startswith("codex_fallback")
+                for item in wf_stages
+            )
+            if not has_codex_fallback:
+                wf_stages.insert(
+                    max(crew_idx + 1, 0),
+                    {
+                        "id": "codex_fallback",
+                        "kind": "codex",
+                        "description": "Fallback codex stage when crewai fails",
+                        "continue_on_error": True,
+                        "prompt_template": "CrewAI failed. Fallback to Codex for goal: {{goal}}",
+                    },
+                )
+                actions.append("added codex fallback stage after crewai failure")
+            if not bool(codex_cfg.get("enabled", False)):
+                codex_cfg["enabled"] = True
+                actions.append("enabled codex runtime after crewai degradation")
+            for item in wf_stages:
                 if (
-                    isinstance(stage, dict)
-                    and stage.get("kind") == "crewai"
-                    and stage.get("status") in {"failed", "degraded"}
+                    isinstance(item, dict)
+                    and str(item.get("id", "")).startswith("codex_fallback")
+                    and not bool(item.get("continue_on_error", False))
                 ):
-                    wf_stages = workflow.get("stages", [])
-                    if isinstance(wf_stages, list):
-                        crew_idx = -1
-                        for idx, item in enumerate(wf_stages):
-                            if isinstance(item, dict) and item.get("id") == "crew_orchestrate":
-                                crew_idx = idx
-                                break
-                        has_codex_fallback = any(
-                            isinstance(item, dict) and str(item.get("id", "")).startswith("codex_fallback")
-                            for item in wf_stages
-                        )
-                        if not has_codex_fallback:
-                            wf_stages.insert(
-                                max(crew_idx + 1, 0),
-                                {
-                                    "id": "codex_fallback",
-                                    "kind": "codex",
-                                    "description": "Fallback codex stage when crewai fails",
-                                    "continue_on_error": True,
-                                    "prompt_template": "CrewAI failed. Fallback to Codex for goal: {{goal}}",
-                                },
-                            )
-                            actions.append("added codex fallback stage after crewai failure")
-                        for item in wf_stages:
-                            if (
-                                isinstance(item, dict)
-                                and str(item.get("id", "")).startswith("codex_fallback")
-                                and not bool(item.get("continue_on_error", False))
-                            ):
-                                item["continue_on_error"] = True
-                                actions.append("set codex_fallback as non-blocking (continue_on_error=true)")
+                    item["continue_on_error"] = True
+                    actions.append("set codex_fallback as non-blocking (continue_on_error=true)")
 
     dump_json(workflow_path, workflow)
     dump_json(evo_path, evo)

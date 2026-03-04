@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List
 
@@ -73,14 +76,26 @@ def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
     try:
         from .crewai_blueprint import build_default_crew, resolve_codex_llm_runtime
 
+        os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
+        os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+        os.environ.setdefault("CREWAI_TESTING", "true")
+        os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
         runtime = resolve_codex_llm_runtime(apply_env=False)
-        crew = build_default_crew(goal=goal_text)
-        result = crew.kickoff()
+        stdout_buffer = StringIO()
+        stderr_buffer = StringIO()
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            crew = build_default_crew(goal=goal_text)
+            result = crew.kickoff()
         log_path.write_text(
             "[crewai_runtime]\n"
             f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
             "[crewai_result]\n"
-            f"{result}\n",
+            f"{result}\n\n"
+            "[crewai_stdout]\n"
+            f"{stdout_buffer.getvalue()}\n"
+            "[crewai_stderr]\n"
+            f"{stderr_buffer.getvalue()}\n",
             encoding="utf-8",
         )
         return 0

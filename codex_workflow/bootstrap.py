@@ -53,7 +53,7 @@ def _default_workflow() -> Dict[str, object]:
         "version": 1,
         "codex": {
             "enabled": False,
-            "command": "codex exec --prompt-file {prompt_file}",
+            "command": "codex exec --skip-git-repo-check - < {prompt_file}",
             "cwd": "{repo_root}",
         },
         "stages": [

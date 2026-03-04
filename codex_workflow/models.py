@@ -42,14 +42,14 @@ class StageConfig:
 @dataclass
 class CodexRuntimeConfig:
     enabled: bool = False
-    command: str = "codex exec --prompt-file {prompt_file}"
+    command: str = "codex exec --skip-git-repo-check - < {prompt_file}"
     cwd: str = "{repo_root}"
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "CodexRuntimeConfig":
         return CodexRuntimeConfig(
             enabled=bool(raw.get("enabled", False)),
-            command=str(raw.get("command", "codex exec --prompt-file {prompt_file}")),
+            command=str(raw.get("command", "codex exec --skip-git-repo-check - < {prompt_file}")),
             cwd=str(raw.get("cwd", "{repo_root}")),
         )
 
