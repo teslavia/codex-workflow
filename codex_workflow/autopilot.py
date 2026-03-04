@@ -366,6 +366,16 @@ def _is_crewai_unavailable(repo_root: Path, report: Dict[str, object]) -> bool:
     return False
 
 
+def _crewai_runtime_preflight() -> Tuple[bool, str]:
+    try:
+        from .crewai_blueprint import _require_crewai  # type: ignore[attr-defined]
+
+        _require_crewai()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _has_codex_timeout(report: Dict[str, object]) -> bool:
     stages = report.get("stages", [])
     if not isinstance(stages, list):
@@ -462,6 +472,22 @@ def _compute_campaign_quality_score(success_rate: float, degraded_rate: float, t
     return round(score, 3)
 
 
+def _compute_capability_score(
+    success_rate: float,
+    degraded_rate: float,
+    timeout_rate: float,
+    productive_rate: float,
+) -> float:
+    # Capability score discounts "all skipped" runs while still rewarding stability.
+    score = 100.0 * (
+        0.45 * max(0.0, min(1.0, success_rate))
+        + 0.20 * (1.0 - max(0.0, min(1.0, degraded_rate)))
+        + 0.15 * (1.0 - max(0.0, min(1.0, timeout_rate)))
+        + 0.20 * max(0.0, min(1.0, productive_rate))
+    )
+    return round(score, 3)
+
+
 def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str, int], List[str]]:
     defaults = {
         "crew_blocked_threshold": 3,
@@ -469,6 +495,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         "codex_timeout_threshold": 3,
         "codex_cooldown_rounds": 4,
         "codex_timeout_seconds": 12,
+        "codex_probe_when_crewai_unavailable": True,
     }
     if not history:
         return defaults, ["adaptive policy: no history, use defaults"]
@@ -552,12 +579,27 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         crew_blocked_threshold = 4
         crew_cooldown_rounds = 3
 
+    expected_probe_capability = _compute_capability_score(
+        success_rate=1.0,
+        degraded_rate=avg_degraded,
+        timeout_rate=avg_timeout,
+        productive_rate=0.10,
+    )
+    expected_skip_capability = _compute_capability_score(
+        success_rate=1.0,
+        degraded_rate=0.0,
+        timeout_rate=0.0,
+        productive_rate=0.0,
+    )
+    codex_probe_when_crewai_unavailable = expected_probe_capability >= expected_skip_capability
+
     policy = {
         "crew_blocked_threshold": crew_blocked_threshold,
         "crew_cooldown_rounds": crew_cooldown_rounds,
         "codex_timeout_threshold": codex_timeout_threshold,
         "codex_cooldown_rounds": codex_cooldown_rounds,
         "codex_timeout_seconds": codex_timeout_seconds,
+        "codex_probe_when_crewai_unavailable": codex_probe_when_crewai_unavailable,
     }
     actions = [
         (
@@ -565,9 +607,12 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
             f"source={source}, weighted=true, avg_timeout_rate={avg_timeout:.3f}, "
             f"avg_degraded_rate={avg_degraded:.3f}, "
             f"avg_strict_success_rate={avg_strict:.3f}, "
+            f"expected_probe_capability={expected_probe_capability:.3f}, "
+            f"expected_skip_capability={expected_skip_capability:.3f}, "
             f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
             f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}, "
-            f"codex_timeout_seconds={codex_timeout_seconds}"
+            f"codex_timeout_seconds={codex_timeout_seconds}, "
+            f"codex_probe_when_crewai_unavailable={policy['codex_probe_when_crewai_unavailable']}"
         )
     ]
     return policy, actions
@@ -674,6 +719,7 @@ def _build_campaign_metrics(
         "runs": 0,
         "success_runs": 0,
         "strict_success_runs": 0,
+        "productive_runs": 0,
         "failed_runs": 0,
         "degraded_stage_runs": 0,
     }
@@ -692,12 +738,14 @@ def _build_campaign_metrics(
         stages = report.get("stages", [])
         degraded_in_run = False
         strict_success_in_run = True
+        productive_in_run = False
         if isinstance(stages, list):
             for stage in stages:
                 if not isinstance(stage, dict):
                     continue
                 stage_id = str(stage.get("stage_id", "unknown"))
                 status = str(stage.get("status", "unknown"))
+                stage_kind = str(stage.get("kind", ""))
                 elapsed = float(stage.get("elapsed_seconds", 0.0))
                 stat = stage_health.get(
                     stage_id,
@@ -718,6 +766,8 @@ def _build_campaign_metrics(
                     degraded_in_run = True
                 if status in {"failed", "degraded", "manual"}:
                     strict_success_in_run = False
+                if stage_kind in {"crewai", "codex"} and status != "skipped":
+                    productive_in_run = True
 
                 cmd_results = stage.get("command_results", [])
                 if isinstance(cmd_results, list):
@@ -731,6 +781,8 @@ def _build_campaign_metrics(
             totals["degraded_stage_runs"] += 1
         if strict_success_in_run:
             totals["strict_success_runs"] += 1
+        if productive_in_run:
+            totals["productive_runs"] += 1
 
     avg_stage_seconds: Dict[str, float] = {}
     for stage_id, total_elapsed in stage_time.items():
@@ -750,9 +802,11 @@ def _build_campaign_metrics(
 
     success_rate = (totals["success_runs"] / totals["runs"]) if totals["runs"] else 0.0
     strict_success_rate = (totals["strict_success_runs"] / totals["runs"]) if totals["runs"] else 0.0
+    productive_run_rate = (totals["productive_runs"] / totals["runs"]) if totals["runs"] else 0.0
     degraded_rate = (totals["degraded_stage_runs"] / totals["runs"]) if totals["runs"] else 0.0
     timeout_rate = (codex_timeout_count / totals["runs"]) if totals["runs"] else 0.0
     quality_score = _compute_campaign_quality_score(success_rate, degraded_rate, timeout_rate)
+    capability_score = _compute_capability_score(success_rate, degraded_rate, timeout_rate, productive_run_rate)
     return {
         "ts": _utc_now(),
         "goal": goal,
@@ -761,13 +815,16 @@ def _build_campaign_metrics(
         "runs": totals["runs"],
         "success_runs": totals["success_runs"],
         "strict_success_runs": totals["strict_success_runs"],
+        "productive_runs": totals["productive_runs"],
         "failed_runs": totals["failed_runs"],
         "success_rate": success_rate,
         "strict_success_rate": strict_success_rate,
+        "productive_run_rate": productive_run_rate,
         "degraded_run_rate": degraded_rate,
         "codex_timeout_count": codex_timeout_count,
         "timeout_rate": timeout_rate,
         "quality_score": quality_score,
+        "capability_score": capability_score,
         "stage_health": stage_health,
         "avg_stage_seconds": avg_stage_seconds,
         "blocked_models_active": blocked_models,
@@ -803,6 +860,28 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
             success_rate=_num(payload.get("success_rate", 0.0)),
             degraded_rate=_num(payload.get("degraded_run_rate", 0.0)),
             timeout_rate=_timeout_rate(payload),
+        )
+
+    def _productive_rate(payload: Dict[str, object]) -> float:
+        if "productive_run_rate" in payload:
+            return _num(payload.get("productive_run_rate", 0.0))
+        try:
+            runs = int(payload.get("runs", 0))
+            productive_runs = int(payload.get("productive_runs", 0))
+        except Exception:
+            return 0.0
+        if runs <= 0:
+            return 0.0
+        return max(0.0, min(1.0, productive_runs / runs))
+
+    def _capability_score(payload: Dict[str, object]) -> float:
+        if "capability_score" in payload:
+            return _num(payload.get("capability_score", 0.0))
+        return _compute_capability_score(
+            success_rate=_num(payload.get("success_rate", 0.0)),
+            degraded_rate=_num(payload.get("degraded_run_rate", 0.0)),
+            timeout_rate=_timeout_rate(payload),
+            productive_rate=_productive_rate(payload),
         )
 
     def _strict_success_runs(payload: Dict[str, object]) -> int:
@@ -869,15 +948,18 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
             "runs": int(_num(current.get("runs", 0)) - _num(previous.get("runs", 0))),
             "success_runs": int(_num(current.get("success_runs", 0)) - _num(previous.get("success_runs", 0))),
             "strict_success_runs": _strict_success_runs(current) - _strict_success_runs(previous),
+            "productive_runs": int(_num(current.get("productive_runs", 0)) - _num(previous.get("productive_runs", 0))),
             "failed_runs": int(_num(current.get("failed_runs", 0)) - _num(previous.get("failed_runs", 0))),
             "success_rate": _num(current.get("success_rate", 0.0)) - _num(previous.get("success_rate", 0.0)),
             "strict_success_rate": _strict_success_rate(current) - _strict_success_rate(previous),
+            "productive_run_rate": _productive_rate(current) - _productive_rate(previous),
             "degraded_run_rate": _num(current.get("degraded_run_rate", 0.0)) - _num(previous.get("degraded_run_rate", 0.0)),
             "timeout_rate": _timeout_rate(current) - _timeout_rate(previous),
             "codex_timeout_count": int(
                 _num(current.get("codex_timeout_count", 0)) - _num(previous.get("codex_timeout_count", 0))
             ),
             "quality_score": _quality_score(current) - _quality_score(previous),
+            "capability_score": _capability_score(current) - _capability_score(previous),
         },
         "stage_health_delta": stage_delta,
         "blocked_models_added": sorted(cur_set - prev_set),
@@ -1082,6 +1164,9 @@ def iterate_goal(
                 "codex_timeout_threshold": state["codex_timeout_threshold"],
                 "codex_cooldown_rounds": state["codex_cooldown_rounds"],
                 "codex_timeout_seconds": codex_timeout_seconds,
+                "codex_probe_when_crewai_unavailable": bool(
+                    adaptive_policy.get("codex_probe_when_crewai_unavailable", True)
+                ),
             },
             "env_overrides": {
                 "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD": "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" in os.environ,
@@ -1098,6 +1183,19 @@ def iterate_goal(
         campaign_boot_actions.append(
             f"set runtime CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS={codex_timeout_seconds} from adaptive policy"
         )
+    crewai_runtime_ok, crewai_runtime_reason = _crewai_runtime_preflight()
+    if not crewai_runtime_ok:
+        state["crew_cooldown_remaining"] = max(int(state.get("crew_cooldown_remaining", 0)), iterations)
+        state["crew_blocked_streak"] = 0
+        campaign_boot_actions.append("preflight locked crew_orchestrate for this campaign (runtime unavailable)")
+        if crewai_runtime_reason:
+            campaign_boot_actions.append(f"preflight crewai runtime reason: {crewai_runtime_reason}")
+        if not bool(adaptive_policy.get("codex_probe_when_crewai_unavailable", True)):
+            state["codex_cooldown_remaining"] = max(int(state.get("codex_cooldown_remaining", 0)), iterations)
+            state["codex_timeout_streak"] = 0
+            campaign_boot_actions.append(
+                "preflight locked codex_fallback for this campaign (policy disables probe under crew-unavailable)"
+            )
 
     for idx in range(1, iterations + 1):
         pre_actions: List[str] = []
@@ -1258,6 +1356,10 @@ def iterate_goal(
     dump_json(metrics_path, metrics)
     summary["strict_success_count"] = int(metrics.get("strict_success_runs", 0) or 0)
     summary["strict_success_rate"] = float(metrics.get("strict_success_rate", 0.0) or 0.0)
+    summary["productive_count"] = int(metrics.get("productive_runs", 0) or 0)
+    summary["productive_run_rate"] = float(metrics.get("productive_run_rate", 0.0) or 0.0)
+    summary["capability_score"] = float(metrics.get("capability_score", 0.0) or 0.0)
+    summary["quality_score"] = float(metrics.get("quality_score", 0.0) or 0.0)
     dump_json(summary_path, summary)
 
     updated_history = _normalize_metrics_history(history_records + [metrics])
