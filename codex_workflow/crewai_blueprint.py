@@ -89,7 +89,7 @@ def resolve_codex_llm_runtime(apply_env: bool = True) -> Dict[str, str]:
     return resolved
 
 
-def build_default_crew(goal: str):
+def build_default_crew(goal: str, model_override: str | None = None):
     """Create a minimal crew for code tasks.
 
     This helper is optional and only used when CrewAI is installed.
@@ -101,7 +101,7 @@ def build_default_crew(goal: str):
     from crewai import Agent, Crew, Process, Task  # type: ignore
 
     agent_kwargs = {"verbose": False}
-    model_name = runtime.get("model")
+    model_name = model_override or runtime.get("model")
     if model_name:
         agent_kwargs["llm"] = model_name
 

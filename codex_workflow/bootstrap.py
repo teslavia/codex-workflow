@@ -53,7 +53,7 @@ def _default_workflow() -> Dict[str, object]:
         "version": 1,
         "codex": {
             "enabled": False,
-            "command": "codex exec --skip-git-repo-check - < {prompt_file}",
+            "command": "codex exec --skip-git-repo-check -o {output_file} - < {prompt_file}",
             "cwd": "{repo_root}",
         },
         "stages": [
@@ -62,6 +62,7 @@ def _default_workflow() -> Dict[str, object]:
                 "kind": "crewai",
                 "description": "Default CrewAI orchestration (planner/coder/tester/reviewer)",
                 "continue_on_error": True,
+                "enabled": True,
                 "prompt_template": (
                     "任务目标: {{goal}}\n"
                     "项目画像: {{project_profile}}\n"

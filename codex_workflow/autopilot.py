@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -96,6 +97,7 @@ def _ensure_crewai_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object]
                 "kind": "crewai",
                 "description": "Default CrewAI orchestration (planner/coder/tester/reviewer)",
                 "continue_on_error": True,
+                "enabled": True,
                 "prompt_template": (
                     "任务目标: {{goal}}\\n"
                     "项目画像: {{project_profile}}\\n"
@@ -110,9 +112,13 @@ def _ensure_crewai_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object]
 
     if crew_index != -1:
         crew_stage = stages[crew_index]
-        if isinstance(crew_stage, dict) and not bool(crew_stage.get("continue_on_error", False)):
-            crew_stage["continue_on_error"] = True
-            actions.append("set crew_orchestrate as non-blocking (continue_on_error=true)")
+        if isinstance(crew_stage, dict):
+            if not bool(crew_stage.get("continue_on_error", False)):
+                crew_stage["continue_on_error"] = True
+                actions.append("set crew_orchestrate as non-blocking (continue_on_error=true)")
+            if "enabled" not in crew_stage:
+                crew_stage["enabled"] = True
+                actions.append("set crew_orchestrate as enabled")
 
     if verify_index != -1 and crew_index > verify_index:
         crew_stage = stages.pop(crew_index)
@@ -155,13 +161,17 @@ def _normalize_codex_runtime(workflow: Dict[str, object]) -> Tuple[Dict[str, obj
         actions.append("inserted missing codex runtime config")
 
     command = codex_cfg.get("command")
-    target_cmd = "codex exec --skip-git-repo-check - < {prompt_file}"
+    target_cmd = "codex exec --skip-git-repo-check -o {output_file} - < {prompt_file}"
     if not isinstance(command, str) or not command.strip():
         codex_cfg["command"] = target_cmd
-        actions.append("set default codex.command for stdin prompt mode")
-    elif "--prompt-file" in command or "codex exec - < {prompt_file}" in command:
+        actions.append("set default codex.command for stdin prompt mode with output file")
+    elif (
+        "--prompt-file" in command
+        or "codex exec - < {prompt_file}" in command
+        or "codex exec --skip-git-repo-check - < {prompt_file}" in command
+    ):
         codex_cfg["command"] = target_cmd
-        actions.append("migrated legacy codex.command to stdin mode with skip-git-repo-check")
+        actions.append("migrated legacy codex.command to stdin mode with output file")
 
     cwd = codex_cfg.get("cwd")
     if not isinstance(cwd, str) or not cwd.strip():
@@ -183,6 +193,83 @@ def _normalize_workflow_structure(repo_root: Path) -> List[str]:
     if actions:
         dump_json(workflow_path, workflow)
     return actions
+
+
+def _load_autopilot_state(repo_root: Path) -> Dict[str, int]:
+    state_path = repo_root / ".codex-workflow" / "memory" / "autopilot_state.json"
+    if not state_path.exists():
+        return {
+            "crew_blocked_streak": 0,
+            "crew_cooldown_remaining": 0,
+            "crew_blocked_threshold": 3,
+            "crew_cooldown_rounds": 5,
+        }
+    raw = load_json(state_path)
+    return {
+        "crew_blocked_streak": int(raw.get("crew_blocked_streak", 0)),
+        "crew_cooldown_remaining": int(raw.get("crew_cooldown_remaining", 0)),
+        "crew_blocked_threshold": int(raw.get("crew_blocked_threshold", 3)),
+        "crew_cooldown_rounds": int(raw.get("crew_cooldown_rounds", 5)),
+    }
+
+
+def _save_autopilot_state(repo_root: Path, state: Dict[str, int]) -> None:
+    state_path = repo_root / ".codex-workflow" / "memory" / "autopilot_state.json"
+    dump_json(state_path, state)
+
+
+def _set_crewai_stage_enabled(repo_root: Path, enabled: bool) -> List[str]:
+    wf_path = repo_root / ".codex-workflow" / "workflow.json"
+    workflow = load_json(wf_path)
+    actions: List[str] = []
+
+    stages = workflow.get("stages", [])
+    changed = False
+    if isinstance(stages, list):
+        for stage in stages:
+            if isinstance(stage, dict) and stage.get("kind") == "crewai":
+                if bool(stage.get("enabled", True)) != enabled:
+                    stage["enabled"] = enabled
+                    changed = True
+                    if enabled:
+                        actions.append("re-enabled crew_orchestrate stage after cooldown")
+                    else:
+                        actions.append("disabled crew_orchestrate stage due to blocked cooldown")
+                break
+
+    if changed:
+        dump_json(wf_path, workflow)
+    return actions
+
+
+def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
+    stages = report.get("stages", [])
+    if not isinstance(stages, list):
+        return False
+
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        if stage.get("kind") != "crewai":
+            continue
+        if stage.get("status") not in {"failed", "degraded"}:
+            continue
+
+        for cmd in stage.get("command_results", []):
+            if not isinstance(cmd, dict):
+                continue
+            log_path = cmd.get("log_path")
+            if not isinstance(log_path, str) or not log_path:
+                continue
+            path = Path(log_path)
+            if not path.is_absolute():
+                path = repo_root / path
+            if not path.exists():
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore").lower()
+            if "your request was blocked" in content or "request was blocked" in content:
+                return True
+    return False
 
 
 def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], iteration: int) -> List[str]:
@@ -245,6 +332,7 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
                         "kind": "codex",
                         "description": "Fallback codex stage when crewai fails",
                         "continue_on_error": True,
+                        "enabled": True,
                         "prompt_template": "CrewAI failed. Fallback to Codex for goal: {{goal}}",
                     },
                 )
@@ -260,6 +348,9 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
                 ):
                     item["continue_on_error"] = True
                     actions.append("set codex_fallback as non-blocking (continue_on_error=true)")
+                if isinstance(item, dict) and str(item.get("id", "")).startswith("codex_fallback") and "enabled" not in item:
+                    item["enabled"] = True
+                    actions.append("set codex_fallback as enabled")
 
     dump_json(workflow_path, workflow)
     dump_json(evo_path, evo)
@@ -308,8 +399,27 @@ def iterate_goal(
     done = 0
     success_count = 0
     last_report_path = None
+    state = _load_autopilot_state(root)
+    try:
+        blocked_threshold = int(os.getenv("CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD", "3"))
+    except ValueError:
+        blocked_threshold = 3
+    try:
+        cooldown_rounds = int(os.getenv("CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS", "5"))
+    except ValueError:
+        cooldown_rounds = 5
+    state["crew_blocked_threshold"] = max(1, blocked_threshold)
+    state["crew_cooldown_rounds"] = max(1, cooldown_rounds)
 
     for idx in range(1, iterations + 1):
+        pre_actions: List[str] = []
+        post_actions: List[str] = []
+        cooldown_before = int(state.get("crew_cooldown_remaining", 0))
+        crew_enabled = cooldown_before <= 0
+        pre_actions.extend(_set_crewai_stage_enabled(root, enabled=crew_enabled))
+        if not crew_enabled:
+            pre_actions.append(f"crewai cooldown active ({cooldown_before} iterations remaining)")
+
         run_goal = f"{goal} [iteration {idx}/{iterations}]"
         report_path = run_workflow(
             repo_root=root,
@@ -319,8 +429,31 @@ def iterate_goal(
             evolve_after_run=False,
         )
         report = load_json(report_path)
+        crew_blocked = _is_crewai_blocked(root, report)
+        if crew_blocked:
+            post_actions.append("detected crewai blocked response")
+
+        if crew_enabled:
+            if crew_blocked:
+                state["crew_blocked_streak"] = int(state.get("crew_blocked_streak", 0)) + 1
+            else:
+                state["crew_blocked_streak"] = 0
+
+            if int(state.get("crew_blocked_streak", 0)) >= int(state.get("crew_blocked_threshold", 3)):
+                state["crew_cooldown_remaining"] = int(state.get("crew_cooldown_rounds", 5))
+                state["crew_blocked_streak"] = 0
+                post_actions.append(
+                    "entered crewai cooldown after repeated blocked responses"
+                )
+        else:
+            state["crew_blocked_streak"] = 0
+            state["crew_cooldown_remaining"] = max(0, cooldown_before - 1)
+            if int(state.get("crew_cooldown_remaining", 0)) == 0:
+                post_actions.append("crewai cooldown completed")
+
         evolve(repo_root=root)
-        actions = _adapt_workflow_after_report(root, report, idx)
+        actions = pre_actions + _adapt_workflow_after_report(root, report, idx) + post_actions
+        _save_autopilot_state(root, state)
         _record_iteration(root, idx, goal, report_path, actions)
 
         done = idx

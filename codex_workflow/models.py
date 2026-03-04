@@ -13,6 +13,7 @@ class StageConfig:
     commands: List[str] = field(default_factory=list)
     command_source: str = ""
     continue_on_error: bool = False
+    enabled: bool = True
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "StageConfig":
@@ -36,20 +37,26 @@ class StageConfig:
             commands=[str(item) for item in commands],
             command_source=str(raw.get("command_source", "")),
             continue_on_error=bool(raw.get("continue_on_error", False)),
+            enabled=bool(raw.get("enabled", True)),
         )
 
 
 @dataclass
 class CodexRuntimeConfig:
     enabled: bool = False
-    command: str = "codex exec --skip-git-repo-check - < {prompt_file}"
+    command: str = "codex exec --skip-git-repo-check -o {output_file} - < {prompt_file}"
     cwd: str = "{repo_root}"
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "CodexRuntimeConfig":
         return CodexRuntimeConfig(
             enabled=bool(raw.get("enabled", False)),
-            command=str(raw.get("command", "codex exec --skip-git-repo-check - < {prompt_file}")),
+            command=str(
+                raw.get(
+                    "command",
+                    "codex exec --skip-git-repo-check -o {output_file} - < {prompt_file}",
+                )
+            ),
             cwd=str(raw.get("cwd", "{repo_root}")),
         )
 

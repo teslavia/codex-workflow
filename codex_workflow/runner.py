@@ -102,26 +102,63 @@ def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
         os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
         runtime = resolve_codex_llm_runtime(apply_env=False)
-        stdout_buffer = StringIO()
-        stderr_buffer = StringIO()
-        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-            crew = build_default_crew(goal=goal_text)
-            result = crew.kickoff()
+        fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
+        fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
+        primary_model = runtime.get("model")
+
+        candidates: List[str | None] = []
+        if isinstance(primary_model, str) and primary_model.strip():
+            candidates.append(primary_model.strip())
+        for model in fallback_models:
+            if model not in candidates:
+                candidates.append(model)
+        if not candidates:
+            candidates = [None]
+
+        attempts: List[Dict[str, str]] = []
+        for model_name in candidates:
+            stdout_buffer = StringIO()
+            stderr_buffer = StringIO()
+            try:
+                with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                    crew = build_default_crew(goal=goal_text, model_override=model_name)
+                    result = crew.kickoff()
+                log_path.write_text(
+                    "[crewai_runtime]\n"
+                    f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
+                    "[crewai_model]\n"
+                    f"{model_name or 'default'}\n\n"
+                    "[crewai_result]\n"
+                    f"{result}\n\n"
+                    "[crewai_stdout]\n"
+                    f"{stdout_buffer.getvalue()}\n"
+                    "[crewai_stderr]\n"
+                    f"{stderr_buffer.getvalue()}\n",
+                    encoding="utf-8",
+                )
+                return 0
+            except Exception as exc:  # pragma: no cover - external dependency/runtime config
+                attempts.append(
+                    {
+                        "model": model_name or "default",
+                        "error": str(exc),
+                        "stdout": stdout_buffer.getvalue(),
+                        "stderr": stderr_buffer.getvalue(),
+                    }
+                )
+
         log_path.write_text(
             "[crewai_runtime]\n"
             f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
-            "[crewai_result]\n"
-            f"{result}\n\n"
-            "[crewai_stdout]\n"
-            f"{stdout_buffer.getvalue()}\n"
-            "[crewai_stderr]\n"
-            f"{stderr_buffer.getvalue()}\n",
+            "[crewai_error]\n"
+            "all model attempts failed\n\n"
+            "[crewai_attempts]\n"
+            f"{json.dumps(attempts, ensure_ascii=False, indent=2)}\n",
             encoding="utf-8",
         )
-        return 0
     except Exception as exc:  # pragma: no cover - external dependency/runtime config
         log_path.write_text(f"[crewai_error]\n{exc}\n", encoding="utf-8")
-        return 1
+    return 1
 
 
 def _commands_from_quality_gates(quality_gates: Dict[str, object], section: str) -> List[str]:
@@ -187,6 +224,21 @@ def run_workflow(
         stage_message = ""
         stage_status = "success"
 
+        if not stage.enabled:
+            elapsed = time.time() - start
+            stage_results.append(
+                StageResult(
+                    stage_id=stage.stage_id,
+                    kind=stage.kind,
+                    status="skipped",
+                    elapsed_seconds=elapsed,
+                    command_results=[],
+                    prompt_path="",
+                    message="stage disabled by workflow policy",
+                )
+            )
+            continue
+
         if stage.kind == "shell":
             shell_commands = _resolve_shell_commands(stage, quality_gates)
             if not shell_commands:
@@ -251,10 +303,12 @@ def run_workflow(
             prompt_path.write_text(prompt + "\n", encoding="utf-8")
             if workflow.codex.enabled:
                 codex_cwd = _render_template(workflow.codex.cwd, {"repo_root": str(repo_root)})
+                output_file = run_dir / f"{stage.stage_id}.codex.final.txt"
                 codex_cmd = _render_template(
                     workflow.codex.command,
                     {
                         "prompt_file": str(prompt_path),
+                        "output_file": str(output_file),
                         "repo_root": str(repo_root),
                     },
                 )
@@ -281,14 +335,44 @@ def run_workflow(
                         log_path=str(log_path),
                     )
                 )
+                output_required = (
+                    "{output_file}" in workflow.codex.command or "{{output_file}}" in workflow.codex.command
+                )
+                if return_code == 0 and output_required and not dry_run:
+                    check_log = run_dir / f"{stage.stage_id}.output_check.log"
+                    has_output = output_file.exists() and output_file.stat().st_size > 0
+                    if has_output:
+                        check_log.write_text(
+                            f"output_file={output_file}\nstatus=ok\n",
+                            encoding="utf-8",
+                        )
+                        check_code = 0
+                    else:
+                        check_log.write_text(
+                            f"output_file={output_file}\nstatus=missing_or_empty\n",
+                            encoding="utf-8",
+                        )
+                        check_code = 65
+                    command_results.append(
+                        CommandResult(
+                            command="codex output check",
+                            return_code=check_code,
+                            log_path=str(check_log),
+                        )
+                    )
+                    if check_code != 0:
+                        return_code = check_code
+                        stage_message = "codex output file missing or empty"
                 if return_code != 0:
                     if stage.continue_on_error:
                         stage_status = "degraded"
-                        stage_message = "codex command failed (non-blocking)"
+                        if not stage_message:
+                            stage_message = "codex command failed (non-blocking)"
                     else:
                         stage_status = "failed"
                         run_status = "failed"
-                        stage_message = "codex command failed"
+                        if not stage_message:
+                            stage_message = "codex command failed"
             else:
                 stage_status = "skipped"
                 stage_message = (
