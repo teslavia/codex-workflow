@@ -431,28 +431,46 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
     if not recent:
         return defaults, ["adaptive policy: empty recent history, use defaults"]
 
-    timeout_rates: List[float] = []
-    degraded_rates: List[float] = []
-    strict_rates: List[float] = []
+    timeout_weighted = 0.0
+    degraded_weighted = 0.0
+    strict_weighted = 0.0
+    weight_total = 0.0
     for item in recent:
-        timeout_rates.append(_compute_timeout_rate(item))
         try:
-            degraded_rates.append(float(item.get("degraded_run_rate", 0.0)))
+            runs = int(item.get("runs", 0))
         except Exception:
-            degraded_rates.append(0.0)
+            runs = 0
+        weight = float(max(1, runs))
+        timeout_value = _compute_timeout_rate(item)
+        try:
+            degraded_value = float(item.get("degraded_run_rate", 0.0))
+        except Exception:
+            degraded_value = 0.0
         try:
             if "strict_success_rate" in item:
-                strict_rates.append(float(item.get("strict_success_rate", 0.0)))
+                strict_value = float(item.get("strict_success_rate", 0.0))
             else:
-                strict_rates.append(max(0.0, float(item.get("success_rate", 0.0)) - float(item.get("degraded_run_rate", 0.0))))
+                strict_value = max(
+                    0.0, float(item.get("success_rate", 0.0)) - float(item.get("degraded_run_rate", 0.0))
+                )
         except Exception:
-            strict_rates.append(0.0)
+            strict_value = 0.0
 
-    avg_timeout = sum(timeout_rates) / len(timeout_rates)
-    avg_degraded = sum(degraded_rates) / len(degraded_rates)
-    avg_strict = sum(strict_rates) / len(strict_rates)
+        timeout_weighted += timeout_value * weight
+        degraded_weighted += degraded_value * weight
+        strict_weighted += strict_value * weight
+        weight_total += weight
 
-    if avg_timeout >= 0.50 and avg_strict < 0.20:
+    if weight_total <= 0:
+        avg_timeout = 0.0
+        avg_degraded = 0.0
+        avg_strict = 0.0
+    else:
+        avg_timeout = timeout_weighted / weight_total
+        avg_degraded = degraded_weighted / weight_total
+        avg_strict = strict_weighted / weight_total
+
+    if avg_timeout >= 0.50 and avg_strict <= 0.20:
         codex_timeout_threshold = 2
         codex_cooldown_rounds = 4
     elif avg_timeout >= 0.75:
@@ -484,7 +502,8 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
     actions = [
         (
             "adaptive policy from recent campaigns: "
-            f"source={source}, avg_timeout_rate={avg_timeout:.3f}, avg_degraded_rate={avg_degraded:.3f}, "
+            f"source={source}, weighted=true, avg_timeout_rate={avg_timeout:.3f}, "
+            f"avg_degraded_rate={avg_degraded:.3f}, "
             f"avg_strict_success_rate={avg_strict:.3f}, "
             f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
             f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}"
