@@ -153,7 +153,15 @@ def _filter_blocked_models(
 
 def _is_blocked_error(text: str) -> bool:
     lowered = text.lower()
-    return "request was blocked" in lowered or "your request was blocked" in lowered
+    patterns = [
+        "request was blocked",
+        "your request was blocked",
+        "error code: 1010",
+        "access denied",
+        "http error 403",
+        "forbidden",
+    ]
+    return any(item in lowered for item in patterns)
 
 
 def _is_crewai_unavailable_error(text: str) -> bool:
@@ -243,6 +251,23 @@ def detect_crewai_runtime_available() -> Tuple[bool, str]:
         return False, str(exc) if str(exc).strip() else reason
 
 
+def _resolve_crewai_model_candidates(raw_fallback: str, runtime_model: str) -> List[str]:
+    fallback_models = [item.strip() for item in raw_fallback.split(",") if item.strip()]
+    discovery_raw = os.getenv(
+        "CODEX_WORKFLOW_CREWAI_DISCOVERY_MODELS",
+        "gpt-5.3-codex,gpt-5-codex,gpt-4.1,gpt-4.1-mini,gpt-4o-mini,o4-mini,o3-mini",
+    )
+    discovery_models = [item.strip() for item in discovery_raw.split(",") if item.strip()]
+
+    merged: List[str] = []
+    if runtime_model.strip():
+        merged.append(runtime_model.strip())
+    for item in fallback_models + discovery_models:
+        if item and item not in merged:
+            merged.append(item)
+    return merged
+
+
 def _run_crewai_stage_subprocess(
     goal_text: str,
     log_path: Path,
@@ -285,7 +310,15 @@ from codex_workflow.crewai_blueprint import build_default_crew, resolve_codex_ll
 
 def _blocked(text: str) -> bool:
     lowered = text.lower()
-    return "request was blocked" in lowered or "your request was blocked" in lowered
+    patterns = [
+        "request was blocked",
+        "your request was blocked",
+        "error code: 1010",
+        "access denied",
+        "http error 403",
+        "forbidden",
+    ]
+    return any(item in lowered for item in patterns)
 
 payload = json.loads(os.environ["CODEX_WORKFLOW_CREWAI_SUBPROCESS_PAYLOAD"])
 goal = str(payload.get("goal", ""))
@@ -842,16 +875,15 @@ def run_workflow(
                 crew_meta: Dict[str, object] = {"attempts": [], "blocked_models": [], "successful_model": ""}
             else:
                 fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
-                fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
+                runtime_model = ""
                 try:
                     from .crewai_blueprint import resolve_codex_llm_runtime
 
                     runtime = resolve_codex_llm_runtime(apply_env=False)
-                    runtime_model = runtime.get("model", "")
-                    if isinstance(runtime_model, str) and runtime_model.strip() and runtime_model not in fallback_models:
-                        fallback_models.insert(0, runtime_model)
+                    runtime_model = str(runtime.get("model", "") or "")
                 except Exception:
-                    pass
+                    runtime_model = ""
+                fallback_models = _resolve_crewai_model_candidates(fallback_raw, runtime_model)
                 now_ts = time.time()
                 try:
                     probe_window_minutes = int(os.getenv("CODEX_WORKFLOW_MODEL_PROBE_WINDOW_MINUTES", "0"))

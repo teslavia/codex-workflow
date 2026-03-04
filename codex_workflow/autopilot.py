@@ -1336,6 +1336,15 @@ def iterate_goal(
                             "tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 in-flight"
                         )
 
+        # Throughput mode may disable lock_remaining_on_timeout; add guard to prevent runaway timeout spikes.
+        if not lock_remaining_on_timeout and idx >= 3 and codex_timeout_events >= 2:
+            lock_remaining_on_timeout = True
+            state["codex_timeout_threshold"] = 1
+            state["codex_cooldown_rounds"] = max(4, int(state.get("codex_cooldown_rounds", 2)))
+            post_actions.append(
+                "activated protective codex lock due to early timeout burst"
+            )
+
         if codex_timeout and (crew_unavailable or not crew_enabled) and lock_remaining_on_timeout:
             lock_codex_remaining = max(0, iterations - idx)
             if lock_codex_remaining > 0:
