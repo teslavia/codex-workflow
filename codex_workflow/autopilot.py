@@ -1128,6 +1128,8 @@ def iterate_goal(
         crew_blocked = _is_crewai_blocked(root, report)
         crew_unavailable = _is_crewai_unavailable(root, report)
         codex_timeout = _has_codex_timeout(report)
+        lock_crew_remaining = 0
+        lock_codex_remaining = 0
         if codex_timeout:
             codex_timeout_events += 1
         if crew_blocked:
@@ -1139,6 +1141,9 @@ def iterate_goal(
 
         if crew_unavailable:
             crew_blocked = True
+            lock_crew_remaining = max(0, iterations - idx)
+            if lock_crew_remaining > 0:
+                post_actions.append("locked crewai for remaining campaign due to missing runtime")
 
         if codex_timeout and int(state.get("codex_timeout_threshold", 3)) > 1:
             state["codex_timeout_threshold"] = 1
@@ -1165,6 +1170,13 @@ def iterate_goal(
                         post_actions.append(
                             "tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 in-flight"
                         )
+
+        if codex_timeout and (crew_unavailable or not crew_enabled):
+            lock_codex_remaining = max(0, iterations - idx)
+            if lock_codex_remaining > 0:
+                post_actions.append(
+                    "locked codex_fallback for remaining campaign after timeout under unavailable-crew context"
+                )
 
         if crew_enabled:
             if crew_blocked:
@@ -1206,6 +1218,13 @@ def iterate_goal(
             state["codex_cooldown_remaining"] = max(0, codex_cooldown_before - 1)
             if int(state.get("codex_cooldown_remaining", 0)) == 0:
                 post_actions.append("codex timeout cooldown completed")
+
+        if lock_crew_remaining > 0:
+            state["crew_cooldown_remaining"] = max(int(state.get("crew_cooldown_remaining", 0)), lock_crew_remaining)
+            state["crew_blocked_streak"] = 0
+        if lock_codex_remaining > 0:
+            state["codex_cooldown_remaining"] = max(int(state.get("codex_cooldown_remaining", 0)), lock_codex_remaining)
+            state["codex_timeout_streak"] = 0
 
         evolve(repo_root=root)
         actions = pre_actions + _adapt_workflow_after_report(root, report, idx) + post_actions
