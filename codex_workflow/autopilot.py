@@ -204,6 +204,10 @@ def _load_autopilot_state(repo_root: Path) -> Dict[str, int]:
             "crew_cooldown_remaining": 0,
             "crew_blocked_threshold": 3,
             "crew_cooldown_rounds": 5,
+            "codex_timeout_streak": 0,
+            "codex_cooldown_remaining": 0,
+            "codex_timeout_threshold": 3,
+            "codex_cooldown_rounds": 4,
         }
     raw = load_json(state_path)
     return {
@@ -211,6 +215,10 @@ def _load_autopilot_state(repo_root: Path) -> Dict[str, int]:
         "crew_cooldown_remaining": int(raw.get("crew_cooldown_remaining", 0)),
         "crew_blocked_threshold": int(raw.get("crew_blocked_threshold", 3)),
         "crew_cooldown_rounds": int(raw.get("crew_cooldown_rounds", 5)),
+        "codex_timeout_streak": int(raw.get("codex_timeout_streak", 0)),
+        "codex_cooldown_remaining": int(raw.get("codex_cooldown_remaining", 0)),
+        "codex_timeout_threshold": int(raw.get("codex_timeout_threshold", 3)),
+        "codex_cooldown_rounds": int(raw.get("codex_cooldown_rounds", 4)),
     }
 
 
@@ -243,6 +251,37 @@ def _set_crewai_stage_enabled(repo_root: Path, enabled: bool) -> List[str]:
     return actions
 
 
+def _set_codex_fallback_stage_enabled(repo_root: Path, enabled: bool) -> List[str]:
+    wf_path = repo_root / ".codex-workflow" / "workflow.json"
+    workflow = load_json(wf_path)
+    actions: List[str] = []
+
+    stages = workflow.get("stages", [])
+    changed = False
+    found_fallback = False
+    if isinstance(stages, list):
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            stage_id = str(stage.get("id", ""))
+            if not stage_id.startswith("codex_fallback"):
+                continue
+            found_fallback = True
+            if bool(stage.get("enabled", True)) != enabled:
+                stage["enabled"] = enabled
+                changed = True
+
+    if changed:
+        dump_json(wf_path, workflow)
+        if enabled:
+            actions.append("re-enabled codex_fallback stage after timeout cooldown")
+        else:
+            actions.append("disabled codex_fallback stage due to timeout cooldown")
+    elif not found_fallback and not enabled:
+        actions.append("codex timeout cooldown requested but no codex_fallback stage exists")
+    return actions
+
+
 def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
     stages = report.get("stages", [])
     if not isinstance(stages, list):
@@ -269,6 +308,24 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
                 continue
             content = path.read_text(encoding="utf-8", errors="ignore").lower()
             if "your request was blocked" in content or "request was blocked" in content:
+                return True
+    return False
+
+
+def _has_codex_timeout(report: Dict[str, object]) -> bool:
+    stages = report.get("stages", [])
+    if not isinstance(stages, list):
+        return False
+    for stage in stages:
+        if not isinstance(stage, dict) or stage.get("kind") != "codex":
+            continue
+        cmd_results = stage.get("command_results", [])
+        if not isinstance(cmd_results, list):
+            continue
+        for item in cmd_results:
+            if not isinstance(item, dict):
+                continue
+            if int(item.get("return_code", 0)) == 124:
                 return True
     return False
 
@@ -668,17 +725,33 @@ def iterate_goal(
         cooldown_rounds = int(os.getenv("CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS", "5"))
     except ValueError:
         cooldown_rounds = 5
+    try:
+        codex_timeout_threshold = int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD", "3"))
+    except ValueError:
+        codex_timeout_threshold = 3
+    try:
+        codex_cooldown_rounds = int(os.getenv("CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS", "4"))
+    except ValueError:
+        codex_cooldown_rounds = 4
     state["crew_blocked_threshold"] = max(1, blocked_threshold)
     state["crew_cooldown_rounds"] = max(1, cooldown_rounds)
+    state["codex_timeout_threshold"] = max(1, codex_timeout_threshold)
+    state["codex_cooldown_rounds"] = max(1, codex_cooldown_rounds)
 
     for idx in range(1, iterations + 1):
         pre_actions: List[str] = []
         post_actions: List[str] = []
-        cooldown_before = int(state.get("crew_cooldown_remaining", 0))
-        crew_enabled = cooldown_before <= 0
+        crew_cooldown_before = int(state.get("crew_cooldown_remaining", 0))
+        crew_enabled = crew_cooldown_before <= 0
         pre_actions.extend(_set_crewai_stage_enabled(root, enabled=crew_enabled))
         if not crew_enabled:
-            pre_actions.append(f"crewai cooldown active ({cooldown_before} iterations remaining)")
+            pre_actions.append(f"crewai cooldown active ({crew_cooldown_before} iterations remaining)")
+
+        codex_cooldown_before = int(state.get("codex_cooldown_remaining", 0))
+        codex_enabled = codex_cooldown_before <= 0
+        pre_actions.extend(_set_codex_fallback_stage_enabled(root, enabled=codex_enabled))
+        if not codex_enabled:
+            pre_actions.append(f"codex timeout cooldown active ({codex_cooldown_before} iterations remaining)")
 
         run_goal = f"{goal} [iteration {idx}/{iterations}]"
         report_path = run_workflow(
@@ -690,8 +763,11 @@ def iterate_goal(
         )
         report = load_json(report_path)
         crew_blocked = _is_crewai_blocked(root, report)
+        codex_timeout = _has_codex_timeout(report)
         if crew_blocked:
             post_actions.append("detected crewai blocked response")
+        if codex_timeout:
+            post_actions.append("detected codex timeout")
 
         if crew_enabled:
             if crew_blocked:
@@ -707,9 +783,25 @@ def iterate_goal(
                 )
         else:
             state["crew_blocked_streak"] = 0
-            state["crew_cooldown_remaining"] = max(0, cooldown_before - 1)
+            state["crew_cooldown_remaining"] = max(0, crew_cooldown_before - 1)
             if int(state.get("crew_cooldown_remaining", 0)) == 0:
                 post_actions.append("crewai cooldown completed")
+
+        if codex_enabled:
+            if codex_timeout:
+                state["codex_timeout_streak"] = int(state.get("codex_timeout_streak", 0)) + 1
+            else:
+                state["codex_timeout_streak"] = 0
+
+            if int(state.get("codex_timeout_streak", 0)) >= int(state.get("codex_timeout_threshold", 3)):
+                state["codex_cooldown_remaining"] = int(state.get("codex_cooldown_rounds", 4))
+                state["codex_timeout_streak"] = 0
+                post_actions.append("entered codex timeout cooldown after repeated timeouts")
+        else:
+            state["codex_timeout_streak"] = 0
+            state["codex_cooldown_remaining"] = max(0, codex_cooldown_before - 1)
+            if int(state.get("codex_cooldown_remaining", 0)) == 0:
+                post_actions.append("codex timeout cooldown completed")
 
         evolve(repo_root=root)
         actions = pre_actions + _adapt_workflow_after_report(root, report, idx) + post_actions
