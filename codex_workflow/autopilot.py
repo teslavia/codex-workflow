@@ -95,6 +95,7 @@ def _ensure_crewai_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object]
                 "id": "crew_orchestrate",
                 "kind": "crewai",
                 "description": "Default CrewAI orchestration (planner/coder/tester/reviewer)",
+                "continue_on_error": True,
                 "prompt_template": (
                     "任务目标: {{goal}}\\n"
                     "项目画像: {{project_profile}}\\n"
@@ -107,10 +108,39 @@ def _ensure_crewai_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object]
         actions.append("inserted missing crew_orchestrate stage")
         crew_index = 0
 
+    if crew_index != -1:
+        crew_stage = stages[crew_index]
+        if isinstance(crew_stage, dict) and not bool(crew_stage.get("continue_on_error", False)):
+            crew_stage["continue_on_error"] = True
+            actions.append("set crew_orchestrate as non-blocking (continue_on_error=true)")
+
     if verify_index != -1 and crew_index > verify_index:
         crew_stage = stages.pop(crew_index)
         stages.insert(0, crew_stage)
         actions.append("moved crew_orchestrate before verify")
+
+    workflow["stages"] = stages
+    return workflow, actions
+
+
+def _ensure_verify_stage(workflow: Dict[str, object]) -> Tuple[Dict[str, object], List[str]]:
+    actions: List[str] = []
+    stages = workflow.get("stages", [])
+    if not isinstance(stages, list):
+        return workflow, actions
+
+    has_verify = any(isinstance(stage, dict) and stage.get("id") == "verify" for stage in stages)
+    if not has_verify:
+        stages.append(
+            {
+                "id": "verify",
+                "kind": "shell",
+                "description": "Run required quality gates",
+                "command_source": "quality_gates.required",
+                "commands": [],
+            }
+        )
+        actions.append("inserted missing verify stage")
 
     workflow["stages"] = stages
     return workflow, actions
@@ -121,6 +151,8 @@ def _normalize_workflow_structure(repo_root: Path) -> List[str]:
     workflow_path = wf_root / "workflow.json"
     workflow = load_json(workflow_path)
     workflow, actions = _ensure_crewai_stage(workflow)
+    workflow, verify_actions = _ensure_verify_stage(workflow)
+    actions.extend(verify_actions)
     if actions:
         dump_json(workflow_path, workflow)
     return actions
@@ -133,6 +165,8 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
     workflow_path = wf_root / "workflow.json"
     workflow = load_json(workflow_path)
     workflow, stage_actions = _ensure_crewai_stage(workflow)
+    workflow, verify_actions = _ensure_verify_stage(workflow)
+    stage_actions.extend(verify_actions)
     actions.extend(stage_actions)
 
     evo_path = wf_root / "evolution.json"
@@ -150,24 +184,42 @@ def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], ite
         stages = report.get("stages", [])
         if isinstance(stages, list):
             for stage in stages:
-                if isinstance(stage, dict) and stage.get("kind") == "crewai" and stage.get("status") == "failed":
+                if (
+                    isinstance(stage, dict)
+                    and stage.get("kind") == "crewai"
+                    and stage.get("status") in {"failed", "degraded"}
+                ):
                     wf_stages = workflow.get("stages", [])
                     if isinstance(wf_stages, list):
+                        crew_idx = -1
+                        for idx, item in enumerate(wf_stages):
+                            if isinstance(item, dict) and item.get("id") == "crew_orchestrate":
+                                crew_idx = idx
+                                break
                         has_codex_fallback = any(
                             isinstance(item, dict) and str(item.get("id", "")).startswith("codex_fallback")
                             for item in wf_stages
                         )
                         if not has_codex_fallback:
                             wf_stages.insert(
-                                1,
+                                max(crew_idx + 1, 0),
                                 {
                                     "id": "codex_fallback",
                                     "kind": "codex",
                                     "description": "Fallback codex stage when crewai fails",
+                                    "continue_on_error": True,
                                     "prompt_template": "CrewAI failed. Fallback to Codex for goal: {{goal}}",
                                 },
                             )
                             actions.append("added codex fallback stage after crewai failure")
+                        for item in wf_stages:
+                            if (
+                                isinstance(item, dict)
+                                and str(item.get("id", "")).startswith("codex_fallback")
+                                and not bool(item.get("continue_on_error", False))
+                            ):
+                                item["continue_on_error"] = True
+                                actions.append("set codex_fallback as non-blocking (continue_on_error=true)")
 
     dump_json(workflow_path, workflow)
     dump_json(evo_path, evo)

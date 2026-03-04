@@ -61,6 +61,7 @@ def _default_workflow() -> Dict[str, object]:
                 "id": "crew_orchestrate",
                 "kind": "crewai",
                 "description": "Default CrewAI orchestration (planner/coder/tester/reviewer)",
+                "continue_on_error": True,
                 "prompt_template": (
                     "任务目标: {{goal}}\n"
                     "项目画像: {{project_profile}}\n"

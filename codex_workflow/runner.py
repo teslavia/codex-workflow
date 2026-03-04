@@ -40,6 +40,7 @@ def _render_template(template: str, context: Dict[str, str]) -> str:
     rendered = template
     for key, value in context.items():
         rendered = rendered.replace("{{" + key + "}}", value)
+        rendered = rendered.replace("{" + key + "}", value)
     return rendered
 
 
@@ -175,10 +176,13 @@ def run_workflow(
                 )
 
                 if return_code != 0:
-                    stage_status = "failed"
-                    run_status = "failed"
-                    stage_message = f"command failed: {cmd}"
-                    if not stage.continue_on_error:
+                    if stage.continue_on_error:
+                        stage_status = "degraded"
+                        stage_message = f"non-blocking command failed: {cmd}"
+                    else:
+                        stage_status = "failed"
+                        run_status = "failed"
+                        stage_message = f"command failed: {cmd}"
                         break
 
         elif stage.kind == "crewai":
@@ -199,9 +203,13 @@ def run_workflow(
                 )
             )
             if return_code != 0:
-                stage_status = "failed"
-                run_status = "failed"
-                stage_message = "crewai stage failed"
+                if stage.continue_on_error:
+                    stage_status = "degraded"
+                    stage_message = "crewai stage failed (non-blocking)"
+                else:
+                    stage_status = "failed"
+                    run_status = "failed"
+                    stage_message = "crewai stage failed"
 
         elif stage.kind == "codex":
             prompt = _render_template(stage.prompt_template, context)
@@ -230,9 +238,13 @@ def run_workflow(
                     )
                 )
                 if return_code != 0:
-                    stage_status = "failed"
-                    run_status = "failed"
-                    stage_message = "codex command failed"
+                    if stage.continue_on_error:
+                        stage_status = "degraded"
+                        stage_message = "codex command failed (non-blocking)"
+                    else:
+                        stage_status = "failed"
+                        run_status = "failed"
+                        stage_message = "codex command failed"
             else:
                 stage_status = "skipped"
                 stage_message = (

@@ -18,6 +18,8 @@ def _scan_reports(run_dir: Path, lookback: int) -> List[Path]:
 
 def _classify_failure(command: str) -> str:
     cmd = command.lower()
+    if "crewai kickoff" in cmd:
+        return "crewai_stage_failure"
     if "ctest" in cmd:
         return "test_failure"
     if "pytest" in cmd:
@@ -53,6 +55,8 @@ def _build_recommendations(
         recs.append("高频测试失败：把失败测试名写入 prompt，要求 coder 先复现再修复。")
     if failure_types.get("codex_stage_failure", 0) > 0:
         recs.append("Codex 执行失败：检查 workflow.json 中 codex.command 与本机 CLI 参数是否一致。")
+    if failure_types.get("crewai_stage_failure", 0) > 0:
+        recs.append("CrewAI 执行失败：确认 Python 版本与 CrewAI 依赖已安装，或保持非阻断降级并走 fallback。")
 
     if not recs:
         recs.append("近几次运行整体稳定，建议继续保持当前 workflow 配置。")
