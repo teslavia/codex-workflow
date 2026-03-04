@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from contextlib import redirect_stderr, redirect_stdout
@@ -106,13 +107,19 @@ def _write_model_cache(path: Path, cache: Dict[str, object]) -> None:
     dump_json(path, cache)
 
 
-def _filter_blocked_models(candidates: List[str], cache: Dict[str, object], now_ts: float) -> Tuple[List[str], List[str]]:
+def _filter_blocked_models(
+    candidates: List[str],
+    cache: Dict[str, object],
+    now_ts: float,
+    probe_window_seconds: int,
+) -> Tuple[List[str], List[str], List[str]]:
     models = cache.get("models", {})
     if not isinstance(models, dict):
-        return candidates, []
+        return candidates, [], []
 
     usable: List[str] = []
     blocked: List[str] = []
+    probe: List[str] = []
     for model in candidates:
         item = models.get(model, {})
         if not isinstance(item, dict):
@@ -120,10 +127,24 @@ def _filter_blocked_models(candidates: List[str], cache: Dict[str, object], now_
             continue
         blocked_until = float(item.get("blocked_until", 0))
         if blocked_until > now_ts:
-            blocked.append(model)
+            remaining = blocked_until - now_ts
+            last_probe_at = float(item.get("last_probe_at", 0))
+            can_probe = (
+                probe_window_seconds > 0
+                and remaining <= probe_window_seconds
+                and (now_ts - last_probe_at) >= probe_window_seconds
+            )
+            if can_probe and not probe:
+                probe.append(model)
+                usable.append(model)
+                item["last_probe_at"] = now_ts
+                models[model] = item
+            else:
+                blocked.append(model)
         else:
             usable.append(model)
-    return usable, blocked
+    cache["models"] = models
+    return usable, blocked, probe
 
 
 def _is_blocked_error(text: str) -> bool:
@@ -227,12 +248,14 @@ def _update_model_cache(
     meta: Dict[str, object],
     now_ts: float,
     ttl_hours: int,
+    hard_skip_hours: int,
 ) -> Dict[str, object]:
     models = cache.get("models", {})
     if not isinstance(models, dict):
         models = {}
 
     ttl_seconds = max(1, ttl_hours) * 3600
+    hard_skip_seconds = max(1, hard_skip_hours) * 3600
     attempts = meta.get("attempts", [])
     if not isinstance(attempts, list):
         attempts = []
@@ -256,7 +279,7 @@ def _update_model_cache(
         item["last_error"] = str(attempt.get("error", ""))
         if model_name in blocked_set:
             item["last_status"] = "blocked"
-            item["blocked_until"] = now_ts + ttl_seconds
+            item["blocked_until"] = now_ts + max(ttl_seconds, hard_skip_seconds)
         else:
             item["last_status"] = "error"
             item["blocked_until"] = float(item.get("blocked_until", 0))
@@ -300,12 +323,50 @@ def _evaluate_codex_output(
 
     raw_keywords = os.getenv("CODEX_WORKFLOW_CODEX_REQUIRE_KEYWORDS", "").strip()
     required_keywords = [item.strip() for item in raw_keywords.split(",") if item.strip()]
+    min_keyword_hits_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_KEYWORD_HITS", "1")
+    try:
+        min_keyword_hits = max(0, int(min_keyword_hits_raw))
+    except ValueError:
+        min_keyword_hits = 1
+
+    if not required_keywords:
+        stop_words = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "that",
+            "this",
+            "from",
+            "into",
+            "then",
+            "goal",
+            "iteration",
+            "工业级",
+            "项目",
+            "工作流",
+            "自动化",
+            "验证",
+            "目标",
+            "完成",
+            "质量",
+            "鲁棒性",
+        }
+        en_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", goal_text.lower())
+        zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", goal_text)
+        merged: List[str] = []
+        for token in en_tokens + zh_tokens:
+            token = token.strip()
+            if token and token not in stop_words and token not in merged:
+                merged.append(token)
+        required_keywords = merged[:8]
 
     payload: Dict[str, object] = {
         "output_file": str(output_file),
         "goal": goal_text,
         "min_chars": min_chars,
         "required_keywords": required_keywords,
+        "min_keyword_hits": min_keyword_hits,
         "status": "ok",
         "checks": [],
     }
@@ -328,14 +389,23 @@ def _evaluate_codex_output(
         check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return 66, f"codex output too short (< {min_chars} chars)"
 
-    if required_keywords:
+    if required_keywords and min_keyword_hits > 0:
         lowered = stripped.lower()
+        hit_keywords = [word for word in required_keywords if word.lower() in lowered]
         missing = [word for word in required_keywords if word.lower() not in lowered]
-        payload["checks"].append({"name": "keywords", "ok": len(missing) == 0, "missing": missing})
-        if missing:
+        keywords_ok = len(hit_keywords) >= min(min_keyword_hits, len(required_keywords))
+        payload["checks"].append(
+            {
+                "name": "keywords",
+                "ok": keywords_ok,
+                "hit": hit_keywords,
+                "missing": missing,
+            }
+        )
+        if not keywords_ok:
             payload["status"] = "missing_keywords"
             check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            return 67, "codex output missing required keywords"
+            return 67, "codex output missing required semantic keywords"
 
     check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0, ""
@@ -466,7 +536,16 @@ def run_workflow(
                 fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
                 fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
                 now_ts = time.time()
-                candidates, blocked_from_cache = _filter_blocked_models(fallback_models, model_cache, now_ts)
+                try:
+                    probe_window_minutes = int(os.getenv("CODEX_WORKFLOW_MODEL_PROBE_WINDOW_MINUTES", "0"))
+                except ValueError:
+                    probe_window_minutes = 0
+                candidates, blocked_from_cache, probe_from_cache = _filter_blocked_models(
+                    fallback_models,
+                    model_cache,
+                    now_ts,
+                    probe_window_seconds=max(0, probe_window_minutes) * 60,
+                )
                 return_code, crew_meta = _run_crewai_stage(
                     crew_goal,
                     log_path,
@@ -474,11 +553,22 @@ def run_workflow(
                     blocked_model_names=blocked_from_cache,
                 )
                 crew_meta["blocked_by_cache"] = blocked_from_cache
+                crew_meta["probe_from_cache"] = probe_from_cache
                 try:
                     ttl_hours = int(os.getenv("CODEX_WORKFLOW_MODEL_BLOCK_TTL_HOURS", "24"))
                 except ValueError:
                     ttl_hours = 24
-                model_cache = _update_model_cache(model_cache, crew_meta, now_ts, ttl_hours=ttl_hours)
+                try:
+                    hard_skip_hours = int(os.getenv("CODEX_WORKFLOW_MODEL_BLOCK_HARD_SKIP_HOURS", "24"))
+                except ValueError:
+                    hard_skip_hours = 24
+                model_cache = _update_model_cache(
+                    model_cache,
+                    crew_meta,
+                    now_ts,
+                    ttl_hours=ttl_hours,
+                    hard_skip_hours=hard_skip_hours,
+                )
                 _write_model_cache(model_cache_path, model_cache)
 
             command_results.append(
@@ -493,6 +583,7 @@ def run_workflow(
                 json.dumps(
                     {
                         "blocked_by_cache": crew_meta.get("blocked_by_cache", []),
+                        "probe_from_cache": crew_meta.get("probe_from_cache", []),
                         "blocked_models_detected": crew_meta.get("blocked_models", []),
                         "successful_model": crew_meta.get("successful_model", ""),
                     },

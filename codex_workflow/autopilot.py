@@ -367,6 +367,58 @@ def _build_campaign_metrics(
     }
 
 
+def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object]) -> Dict[str, object]:
+    def _num(value: object) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    stage_delta: Dict[str, Dict[str, int]] = {}
+    current_stage = current.get("stage_health", {})
+    prev_stage = previous.get("stage_health", {})
+    if isinstance(current_stage, dict) and isinstance(prev_stage, dict):
+        for stage_id in sorted(set(current_stage.keys()) | set(prev_stage.keys())):
+            cur = current_stage.get(stage_id, {})
+            prv = prev_stage.get(stage_id, {})
+            if not isinstance(cur, dict):
+                cur = {}
+            if not isinstance(prv, dict):
+                prv = {}
+            stage_delta[stage_id] = {
+                "total": int(cur.get("total", 0)) - int(prv.get("total", 0)),
+                "success": int(cur.get("success", 0)) - int(prv.get("success", 0)),
+                "degraded": int(cur.get("degraded", 0)) - int(prv.get("degraded", 0)),
+                "failed": int(cur.get("failed", 0)) - int(prv.get("failed", 0)),
+                "skipped": int(cur.get("skipped", 0)) - int(prv.get("skipped", 0)),
+            }
+
+    prev_blocked = previous.get("blocked_models_active", [])
+    cur_blocked = current.get("blocked_models_active", [])
+    prev_set = {str(item) for item in prev_blocked} if isinstance(prev_blocked, list) else set()
+    cur_set = {str(item) for item in cur_blocked} if isinstance(cur_blocked, list) else set()
+
+    return {
+        "ts": _utc_now(),
+        "goal": current.get("goal", ""),
+        "campaign_id": current.get("campaign_id", ""),
+        "base_campaign_id": previous.get("campaign_id", ""),
+        "delta": {
+            "runs": int(_num(current.get("runs", 0)) - _num(previous.get("runs", 0))),
+            "success_runs": int(_num(current.get("success_runs", 0)) - _num(previous.get("success_runs", 0))),
+            "failed_runs": int(_num(current.get("failed_runs", 0)) - _num(previous.get("failed_runs", 0))),
+            "success_rate": _num(current.get("success_rate", 0.0)) - _num(previous.get("success_rate", 0.0)),
+            "degraded_run_rate": _num(current.get("degraded_run_rate", 0.0)) - _num(previous.get("degraded_run_rate", 0.0)),
+            "codex_timeout_count": int(
+                _num(current.get("codex_timeout_count", 0)) - _num(previous.get("codex_timeout_count", 0))
+            ),
+        },
+        "stage_health_delta": stage_delta,
+        "blocked_models_added": sorted(cur_set - prev_set),
+        "blocked_models_removed": sorted(prev_set - cur_set),
+    }
+
+
 def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], iteration: int) -> List[str]:
     actions: List[str] = []
     wf_root = repo_root / ".codex-workflow"
@@ -492,6 +544,11 @@ def iterate_goal(
 
     wf_root = root / ".codex-workflow"
     summary_path = wf_root / "memory" / "autopilot_latest.json"
+    metrics_path = wf_root / "memory" / "autopilot_metrics_latest.json"
+    metrics_diff_path = wf_root / "memory" / "autopilot_metrics_diff_latest.json"
+    previous_metrics: Dict[str, object] = {}
+    if metrics_path.exists():
+        previous_metrics = load_json(metrics_path)
 
     done = 0
     success_count = 0
@@ -579,5 +636,8 @@ def iterate_goal(
     dump_json(summary_path, summary)
 
     metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports)
-    dump_json(wf_root / "memory" / "autopilot_metrics_latest.json", metrics)
+    dump_json(metrics_path, metrics)
+    if previous_metrics:
+        metrics_diff = _build_metrics_diff(previous_metrics, metrics)
+        dump_json(metrics_diff_path, metrics_diff)
     return summary_path
