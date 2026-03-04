@@ -349,6 +349,42 @@ def _load_jsonl_records(path: Path) -> List[Dict[str, object]]:
     return records
 
 
+def _parse_metric_ts(value: object) -> float:
+    if not isinstance(value, str) or not value.strip():
+        return 0.0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _normalize_metrics_history(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    indexed: Dict[str, Tuple[float, int, Dict[str, object]]] = {}
+    no_id: List[Tuple[float, int, Dict[str, object]]] = []
+    for idx, item in enumerate(records):
+        if not isinstance(item, dict):
+            continue
+        ts = _parse_metric_ts(item.get("ts"))
+        cid = str(item.get("campaign_id", "")).strip()
+        if not cid:
+            no_id.append((ts, idx, item))
+            continue
+        prev = indexed.get(cid)
+        if prev is None or (ts, idx) >= (prev[0], prev[1]):
+            indexed[cid] = (ts, idx, item)
+
+    merged: List[Tuple[float, int, Dict[str, object]]] = list(indexed.values()) + no_id
+    merged.sort(key=lambda pair: (pair[0], pair[1]))
+    return [item for _, _, item in merged]
+
+
+def _rewrite_jsonl_records(path: Path, records: List[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for item in records:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
 def _compute_timeout_rate(item: Dict[str, object]) -> float:
     try:
         runs = int(item.get("runs", 0))
@@ -882,7 +918,10 @@ def iterate_goal(
     campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     campaign_reports: List[Path] = []
     state = _load_autopilot_state(root)
-    history_records = _load_jsonl_records(metrics_history_path)
+    raw_history_records = _load_jsonl_records(metrics_history_path)
+    history_records = _normalize_metrics_history(raw_history_records)
+    if len(history_records) != len(raw_history_records):
+        _rewrite_jsonl_records(metrics_history_path, history_records)
     adaptive_policy, adaptive_actions = _derive_adaptive_policy(history_records)
     try:
         blocked_threshold = int(os.getenv("CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD", "3"))
@@ -1039,8 +1078,8 @@ def iterate_goal(
     summary["strict_success_rate"] = float(metrics.get("strict_success_rate", 0.0) or 0.0)
     dump_json(summary_path, summary)
 
-    history_records = _load_jsonl_records(metrics_history_path)
-    append_jsonl(metrics_history_path, metrics)
+    updated_history = _normalize_metrics_history(history_records + [metrics])
+    _rewrite_jsonl_records(metrics_history_path, updated_history)
 
     baseline, baseline_reason = _select_metrics_baseline(history_records, metrics)
     if baseline is None and previous_metrics:
