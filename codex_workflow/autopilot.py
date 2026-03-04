@@ -272,6 +272,101 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
     return False
 
 
+def _build_campaign_metrics(
+    goal: str,
+    campaign_id: str,
+    report_paths: List[Path],
+) -> Dict[str, object]:
+    totals = {
+        "runs": 0,
+        "success_runs": 0,
+        "failed_runs": 0,
+        "degraded_stage_runs": 0,
+    }
+    stage_health: Dict[str, Dict[str, int]] = {}
+    stage_time: Dict[str, float] = {}
+    codex_timeout_count = 0
+
+    for report_path in report_paths:
+        report = load_json(report_path)
+        totals["runs"] += 1
+        if report.get("status") == "success":
+            totals["success_runs"] += 1
+        else:
+            totals["failed_runs"] += 1
+
+        stages = report.get("stages", [])
+        degraded_in_run = False
+        if isinstance(stages, list):
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                stage_id = str(stage.get("stage_id", "unknown"))
+                status = str(stage.get("status", "unknown"))
+                elapsed = float(stage.get("elapsed_seconds", 0.0))
+                stat = stage_health.get(
+                    stage_id,
+                    {
+                        "total": 0,
+                        "success": 0,
+                        "degraded": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                    },
+                )
+                stat["total"] += 1
+                if status in stat:
+                    stat[status] += 1
+                stage_health[stage_id] = stat
+                stage_time[stage_id] = stage_time.get(stage_id, 0.0) + elapsed
+                if status == "degraded":
+                    degraded_in_run = True
+
+                cmd_results = stage.get("command_results", [])
+                if isinstance(cmd_results, list):
+                    for cmd in cmd_results:
+                        if not isinstance(cmd, dict):
+                            continue
+                        if int(cmd.get("return_code", 0)) == 124:
+                            codex_timeout_count += 1
+
+        if degraded_in_run:
+            totals["degraded_stage_runs"] += 1
+
+    avg_stage_seconds: Dict[str, float] = {}
+    for stage_id, total_elapsed in stage_time.items():
+        count = stage_health.get(stage_id, {}).get("total", 0)
+        avg_stage_seconds[stage_id] = (total_elapsed / count) if count else 0.0
+
+    model_cache_path = report_paths[-1].parents[2] / "memory" / "model_availability.json" if report_paths else None
+    blocked_models = []
+    if model_cache_path and model_cache_path.exists():
+        model_cache = load_json(model_cache_path)
+        models = model_cache.get("models", {})
+        if isinstance(models, dict):
+            now_ts = datetime.now(timezone.utc).timestamp()
+            for name, item in models.items():
+                if isinstance(item, dict) and float(item.get("blocked_until", 0)) > now_ts:
+                    blocked_models.append(str(name))
+
+    success_rate = (totals["success_runs"] / totals["runs"]) if totals["runs"] else 0.0
+    degraded_rate = (totals["degraded_stage_runs"] / totals["runs"]) if totals["runs"] else 0.0
+    return {
+        "ts": _utc_now(),
+        "goal": goal,
+        "campaign_id": campaign_id,
+        "runs": totals["runs"],
+        "success_runs": totals["success_runs"],
+        "failed_runs": totals["failed_runs"],
+        "success_rate": success_rate,
+        "degraded_run_rate": degraded_rate,
+        "codex_timeout_count": codex_timeout_count,
+        "stage_health": stage_health,
+        "avg_stage_seconds": avg_stage_seconds,
+        "blocked_models_active": blocked_models,
+    }
+
+
 def _adapt_workflow_after_report(repo_root: Path, report: Dict[str, object], iteration: int) -> List[str]:
     actions: List[str] = []
     wf_root = repo_root / ".codex-workflow"
@@ -365,10 +460,12 @@ def _record_iteration(
     goal: str,
     report_path: Path,
     actions: List[str],
+    campaign_id: str,
 ) -> None:
     report = load_json(report_path)
     payload = {
         "ts": _utc_now(),
+        "campaign_id": campaign_id,
         "iteration": iteration,
         "goal": goal,
         "status": report.get("status", "unknown"),
@@ -399,6 +496,8 @@ def iterate_goal(
     done = 0
     success_count = 0
     last_report_path = None
+    campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    campaign_reports: List[Path] = []
     state = _load_autopilot_state(root)
     try:
         blocked_threshold = int(os.getenv("CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD", "3"))
@@ -454,10 +553,11 @@ def iterate_goal(
         evolve(repo_root=root)
         actions = pre_actions + _adapt_workflow_after_report(root, report, idx) + post_actions
         _save_autopilot_state(root, state)
-        _record_iteration(root, idx, goal, report_path, actions)
+        _record_iteration(root, idx, goal, report_path, actions, campaign_id=campaign_id)
 
         done = idx
         last_report_path = str(report_path)
+        campaign_reports.append(report_path)
         if report.get("status") == "success":
             success_count += 1
 
@@ -467,6 +567,7 @@ def iterate_goal(
     summary = {
         "ts": _utc_now(),
         "goal": goal,
+        "campaign_id": campaign_id,
         "iterations_requested": iterations,
         "iterations_completed": done,
         "dry_run": dry_run,
@@ -476,4 +577,7 @@ def iterate_goal(
         "last_report_path": last_report_path,
     }
     dump_json(summary_path, summary)
+
+    metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports)
+    dump_json(wf_root / "memory" / "autopilot_metrics_latest.json", metrics)
     return summary_path

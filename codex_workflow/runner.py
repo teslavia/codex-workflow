@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .models import CommandResult, RunReport, StageConfig, StageResult, WorkflowConfig
 from .utils import append_jsonl, dump_json, load_json
@@ -92,7 +92,52 @@ def _run_shell_command(command: str, cwd: Path, log_path: Path, timeout_seconds:
     return return_code
 
 
-def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
+def _read_model_cache(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {"models": {}}
+    data = load_json(path)
+    models = data.get("models", {})
+    if not isinstance(models, dict):
+        models = {}
+    return {"models": models}
+
+
+def _write_model_cache(path: Path, cache: Dict[str, object]) -> None:
+    dump_json(path, cache)
+
+
+def _filter_blocked_models(candidates: List[str], cache: Dict[str, object], now_ts: float) -> Tuple[List[str], List[str]]:
+    models = cache.get("models", {})
+    if not isinstance(models, dict):
+        return candidates, []
+
+    usable: List[str] = []
+    blocked: List[str] = []
+    for model in candidates:
+        item = models.get(model, {})
+        if not isinstance(item, dict):
+            usable.append(model)
+            continue
+        blocked_until = float(item.get("blocked_until", 0))
+        if blocked_until > now_ts:
+            blocked.append(model)
+        else:
+            usable.append(model)
+    return usable, blocked
+
+
+def _is_blocked_error(text: str) -> bool:
+    lowered = text.lower()
+    return "request was blocked" in lowered or "your request was blocked" in lowered
+
+
+def _run_crewai_stage(
+    goal_text: str,
+    log_path: Path,
+    candidates: List[str],
+    blocked_model_names: List[str],
+) -> Tuple[int, Dict[str, object]]:
+    meta: Dict[str, object] = {"attempts": [], "blocked_models": [], "successful_model": ""}
     try:
         from .crewai_blueprint import build_default_crew, resolve_codex_llm_runtime
 
@@ -102,32 +147,35 @@ def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
         os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
         runtime = resolve_codex_llm_runtime(apply_env=False)
-        fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
-        fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
-        primary_model = runtime.get("model")
-
-        candidates: List[str | None] = []
-        if isinstance(primary_model, str) and primary_model.strip():
-            candidates.append(primary_model.strip())
-        for model in fallback_models:
-            if model not in candidates:
-                candidates.append(model)
-        if not candidates:
-            candidates = [None]
+        runtime_model = runtime.get("model")
+        full_candidates = list(candidates)
+        if isinstance(runtime_model, str) and runtime_model.strip() and runtime_model not in full_candidates:
+            full_candidates.insert(0, runtime_model)
+        if blocked_model_names:
+            full_candidates = [item for item in full_candidates if item not in set(blocked_model_names)]
+        if not full_candidates:
+            log_path.write_text(
+                "[crewai_error]\n"
+                "no model candidates available (all candidates currently blocked by cache)\n",
+                encoding="utf-8",
+            )
+            return 2, meta
 
         attempts: List[Dict[str, str]] = []
-        for model_name in candidates:
+        blocked_models: List[str] = []
+        for model_name in full_candidates:
+            model_override = model_name.strip() if isinstance(model_name, str) else ""
             stdout_buffer = StringIO()
             stderr_buffer = StringIO()
             try:
                 with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                    crew = build_default_crew(goal=goal_text, model_override=model_name)
+                    crew = build_default_crew(goal=goal_text, model_override=(model_override or None))
                     result = crew.kickoff()
                 log_path.write_text(
                     "[crewai_runtime]\n"
                     f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
                     "[crewai_model]\n"
-                    f"{model_name or 'default'}\n\n"
+                    f"{model_override or 'default'}\n\n"
                     "[crewai_result]\n"
                     f"{result}\n\n"
                     "[crewai_stdout]\n"
@@ -136,29 +184,161 @@ def _run_crewai_stage(goal_text: str, log_path: Path) -> int:
                     f"{stderr_buffer.getvalue()}\n",
                     encoding="utf-8",
                 )
-                return 0
+                meta["attempts"] = attempts
+                meta["blocked_models"] = blocked_models
+                meta["successful_model"] = model_override or "default"
+                return 0, meta
             except Exception as exc:  # pragma: no cover - external dependency/runtime config
+                err_text = str(exc)
+                stdout_text = stdout_buffer.getvalue()
+                stderr_text = stderr_buffer.getvalue()
+                if _is_blocked_error(err_text) or _is_blocked_error(stdout_text) or _is_blocked_error(stderr_text):
+                    blocked_models.append(model_override or "default")
                 attempts.append(
                     {
-                        "model": model_name or "default",
-                        "error": str(exc),
-                        "stdout": stdout_buffer.getvalue(),
-                        "stderr": stderr_buffer.getvalue(),
+                        "model": model_override or "default",
+                        "error": err_text,
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
                     }
                 )
 
         log_path.write_text(
-            "[crewai_runtime]\n"
-            f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
             "[crewai_error]\n"
             "all model attempts failed\n\n"
             "[crewai_attempts]\n"
             f"{json.dumps(attempts, ensure_ascii=False, indent=2)}\n",
             encoding="utf-8",
         )
+        meta["attempts"] = attempts
+        meta["blocked_models"] = blocked_models
+        meta["successful_model"] = ""
+        return 1, meta
     except Exception as exc:  # pragma: no cover - external dependency/runtime config
         log_path.write_text(f"[crewai_error]\n{exc}\n", encoding="utf-8")
-    return 1
+        meta["attempts"] = [{"model": "default", "error": str(exc), "stdout": "", "stderr": ""}]
+        meta["blocked_models"] = []
+        meta["successful_model"] = ""
+        return 1, meta
+
+
+def _update_model_cache(
+    cache: Dict[str, object],
+    meta: Dict[str, object],
+    now_ts: float,
+    ttl_hours: int,
+) -> Dict[str, object]:
+    models = cache.get("models", {})
+    if not isinstance(models, dict):
+        models = {}
+
+    ttl_seconds = max(1, ttl_hours) * 3600
+    attempts = meta.get("attempts", [])
+    if not isinstance(attempts, list):
+        attempts = []
+
+    success_model = str(meta.get("successful_model", "")).strip()
+    blocked_set = set()
+    blocked_raw = meta.get("blocked_models", [])
+    if isinstance(blocked_raw, list):
+        blocked_set = {str(item).strip() for item in blocked_raw if str(item).strip()}
+
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        model_name = str(attempt.get("model", "")).strip()
+        if not model_name:
+            continue
+        item = models.get(model_name, {})
+        if not isinstance(item, dict):
+            item = {}
+        item["last_seen"] = now_ts
+        item["last_error"] = str(attempt.get("error", ""))
+        if model_name in blocked_set:
+            item["last_status"] = "blocked"
+            item["blocked_until"] = now_ts + ttl_seconds
+        else:
+            item["last_status"] = "error"
+            item["blocked_until"] = float(item.get("blocked_until", 0))
+        models[model_name] = item
+
+    if success_model:
+        item = models.get(success_model, {})
+        if not isinstance(item, dict):
+            item = {}
+        item["last_seen"] = now_ts
+        item["last_status"] = "ok"
+        item["last_error"] = ""
+        item["blocked_until"] = 0
+        models[success_model] = item
+
+    for key in list(models.keys()):
+        value = models.get(key, {})
+        if not isinstance(value, dict):
+            continue
+        blocked_until = float(value.get("blocked_until", 0))
+        if blocked_until > 0 and blocked_until <= now_ts:
+            value["blocked_until"] = 0
+            if value.get("last_status") == "blocked":
+                value["last_status"] = "expired"
+            models[key] = value
+
+    cache["models"] = models
+    return cache
+
+
+def _evaluate_codex_output(
+    output_file: Path,
+    goal_text: str,
+    check_log: Path,
+) -> Tuple[int, str]:
+    min_chars_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_CHARS", "80")
+    try:
+        min_chars = max(20, int(min_chars_raw))
+    except ValueError:
+        min_chars = 80
+
+    raw_keywords = os.getenv("CODEX_WORKFLOW_CODEX_REQUIRE_KEYWORDS", "").strip()
+    required_keywords = [item.strip() for item in raw_keywords.split(",") if item.strip()]
+
+    payload: Dict[str, object] = {
+        "output_file": str(output_file),
+        "goal": goal_text,
+        "min_chars": min_chars,
+        "required_keywords": required_keywords,
+        "status": "ok",
+        "checks": [],
+    }
+
+    if not output_file.exists():
+        payload["status"] = "missing"
+        payload["checks"] = [{"name": "exists", "ok": False}]
+        check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return 65, "codex output file missing"
+
+    text = output_file.read_text(encoding="utf-8", errors="ignore")
+    stripped = text.strip()
+    length_ok = len(stripped) >= min_chars
+    payload["checks"] = [
+        {"name": "exists", "ok": True},
+        {"name": "min_chars", "ok": length_ok, "actual": len(stripped)},
+    ]
+    if not length_ok:
+        payload["status"] = "too_short"
+        check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return 66, f"codex output too short (< {min_chars} chars)"
+
+    if required_keywords:
+        lowered = stripped.lower()
+        missing = [word for word in required_keywords if word.lower() not in lowered]
+        payload["checks"].append({"name": "keywords", "ok": len(missing) == 0, "missing": missing})
+        if missing:
+            payload["status"] = "missing_keywords"
+            check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return 67, "codex output missing required keywords"
+
+    check_log.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0, ""
 
 
 def _commands_from_quality_gates(quality_gates: Dict[str, object], section: str) -> List[str]:
@@ -206,6 +386,8 @@ def run_workflow(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     lessons = _read_recent_lessons(wf_root / "memory" / "lessons.jsonl", limit=6)
+    model_cache_path = wf_root / "memory" / "model_availability.json"
+    model_cache = _read_model_cache(model_cache_path)
 
     context = {
         "goal": goal,
@@ -279,8 +461,25 @@ def run_workflow(
             if dry_run:
                 return_code = 0
                 log_path.write_text(f"[dry-run] crewai goal: {crew_goal}\n", encoding="utf-8")
+                crew_meta: Dict[str, object] = {"attempts": [], "blocked_models": [], "successful_model": ""}
             else:
-                return_code = _run_crewai_stage(crew_goal, log_path)
+                fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
+                fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
+                now_ts = time.time()
+                candidates, blocked_from_cache = _filter_blocked_models(fallback_models, model_cache, now_ts)
+                return_code, crew_meta = _run_crewai_stage(
+                    crew_goal,
+                    log_path,
+                    candidates=candidates,
+                    blocked_model_names=blocked_from_cache,
+                )
+                crew_meta["blocked_by_cache"] = blocked_from_cache
+                try:
+                    ttl_hours = int(os.getenv("CODEX_WORKFLOW_MODEL_BLOCK_TTL_HOURS", "24"))
+                except ValueError:
+                    ttl_hours = 24
+                model_cache = _update_model_cache(model_cache, crew_meta, now_ts, ttl_hours=ttl_hours)
+                _write_model_cache(model_cache_path, model_cache)
 
             command_results.append(
                 CommandResult(
@@ -289,10 +488,34 @@ def run_workflow(
                     log_path=str(log_path),
                 )
             )
+            cache_log = run_dir / f"{stage.stage_id}.model_cache.log"
+            cache_log.write_text(
+                json.dumps(
+                    {
+                        "blocked_by_cache": crew_meta.get("blocked_by_cache", []),
+                        "blocked_models_detected": crew_meta.get("blocked_models", []),
+                        "successful_model": crew_meta.get("successful_model", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            command_results.append(
+                CommandResult(
+                    command="crewai model cache update",
+                    return_code=0,
+                    log_path=str(cache_log),
+                )
+            )
             if return_code != 0:
                 if stage.continue_on_error:
                     stage_status = "degraded"
-                    stage_message = "crewai stage failed (non-blocking)"
+                    if return_code == 2:
+                        stage_message = "crewai stage skipped by model block cache (non-blocking)"
+                    else:
+                        stage_message = "crewai stage failed (non-blocking)"
                 else:
                     stage_status = "failed"
                     run_status = "failed"
@@ -325,7 +548,7 @@ def run_workflow(
                         codex_cmd,
                         Path(codex_cwd),
                         log_path,
-                        timeout_seconds=max(30, codex_timeout),
+                        timeout_seconds=max(5, codex_timeout),
                     )
 
                 command_results.append(
@@ -340,29 +563,21 @@ def run_workflow(
                 )
                 if return_code == 0 and output_required and not dry_run:
                     check_log = run_dir / f"{stage.stage_id}.output_check.log"
-                    has_output = output_file.exists() and output_file.stat().st_size > 0
-                    if has_output:
-                        check_log.write_text(
-                            f"output_file={output_file}\nstatus=ok\n",
-                            encoding="utf-8",
-                        )
-                        check_code = 0
-                    else:
-                        check_log.write_text(
-                            f"output_file={output_file}\nstatus=missing_or_empty\n",
-                            encoding="utf-8",
-                        )
-                        check_code = 65
+                    check_code, check_message = _evaluate_codex_output(
+                        output_file=output_file,
+                        goal_text=goal,
+                        check_log=check_log,
+                    )
                     command_results.append(
                         CommandResult(
-                            command="codex output check",
+                            command="codex completion check",
                             return_code=check_code,
                             log_path=str(check_log),
                         )
                     )
                     if check_code != 0:
                         return_code = check_code
-                        stage_message = "codex output file missing or empty"
+                        stage_message = check_message
                 if return_code != 0:
                     if stage.continue_on_error:
                         stage_status = "degraded"
