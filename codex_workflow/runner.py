@@ -315,19 +315,22 @@ def _evaluate_codex_output(
     goal_text: str,
     check_log: Path,
 ) -> Tuple[int, str]:
-    min_chars_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_CHARS", "80")
-    try:
-        min_chars = max(20, int(min_chars_raw))
-    except ValueError:
-        min_chars = 80
+    goal_en_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", goal_text.lower())
+    goal_zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", goal_text)
+    semantic_units = len(goal_en_tokens) + len(goal_zh_tokens)
+
+    min_chars_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_CHARS", "").strip()
+    adaptive_min_chars = max(60, min(300, 50 + semantic_units * 12))
+    if min_chars_raw:
+        try:
+            min_chars = max(20, int(min_chars_raw))
+        except ValueError:
+            min_chars = adaptive_min_chars
+    else:
+        min_chars = adaptive_min_chars
 
     raw_keywords = os.getenv("CODEX_WORKFLOW_CODEX_REQUIRE_KEYWORDS", "").strip()
     required_keywords = [item.strip() for item in raw_keywords.split(",") if item.strip()]
-    min_keyword_hits_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_KEYWORD_HITS", "1")
-    try:
-        min_keyword_hits = max(0, int(min_keyword_hits_raw))
-    except ValueError:
-        min_keyword_hits = 1
 
     if not required_keywords:
         stop_words = {
@@ -352,14 +355,24 @@ def _evaluate_codex_output(
             "质量",
             "鲁棒性",
         }
-        en_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", goal_text.lower())
-        zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", goal_text)
         merged: List[str] = []
-        for token in en_tokens + zh_tokens:
+        for token in goal_en_tokens + goal_zh_tokens:
             token = token.strip()
             if token and token not in stop_words and token not in merged:
                 merged.append(token)
         required_keywords = merged[:8]
+
+    min_keyword_hits_raw = os.getenv("CODEX_WORKFLOW_CODEX_MIN_KEYWORD_HITS", "").strip()
+    if min_keyword_hits_raw:
+        try:
+            min_keyword_hits = max(0, int(min_keyword_hits_raw))
+        except ValueError:
+            min_keyword_hits = 1
+    else:
+        if required_keywords:
+            min_keyword_hits = max(1, min(3, len(required_keywords) // 2))
+        else:
+            min_keyword_hits = 0
 
     payload: Dict[str, object] = {
         "output_file": str(output_file),
@@ -593,13 +606,15 @@ def run_workflow(
                 + "\n",
                 encoding="utf-8",
             )
-            command_results.append(
-                CommandResult(
-                    command="crewai model cache update",
-                    return_code=0,
-                    log_path=str(cache_log),
+            should_record_cache_command = return_code != 2 or bool(crew_meta.get("probe_from_cache", []))
+            if should_record_cache_command:
+                command_results.append(
+                    CommandResult(
+                        command="crewai model cache update",
+                        return_code=0,
+                        log_path=str(cache_log),
+                    )
                 )
-            )
             if return_code != 0:
                 if stage.continue_on_error:
                     stage_status = "degraded"

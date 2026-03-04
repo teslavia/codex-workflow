@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -270,6 +271,108 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
             if "your request was blocked" in content or "request was blocked" in content:
                 return True
     return False
+
+
+def _load_jsonl_records(path: Path) -> List[Dict[str, object]]:
+    if not path.exists():
+        return []
+    records: List[Dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+def _metrics_scale_bucket(runs: int) -> str:
+    if runs <= 3:
+        return "micro"
+    if runs <= 10:
+        return "small"
+    if runs <= 30:
+        return "medium"
+    if runs <= 100:
+        return "large"
+    return "xlarge"
+
+
+def _choose_nearest_runs_baseline(
+    candidates: List[Dict[str, object]],
+    target_runs: int,
+) -> Dict[str, object] | None:
+    best_item: Dict[str, object] | None = None
+    best_key: Tuple[int, int] | None = None
+    for item in reversed(candidates):
+        try:
+            runs = int(item.get("runs", 0))
+        except Exception:
+            runs = 0
+        key = (abs(runs - target_runs), 0 if runs >= target_runs else 1)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_item = item
+    return best_item
+
+
+def _select_metrics_baseline(
+    history: List[Dict[str, object]],
+    current: Dict[str, object],
+) -> Tuple[Dict[str, object] | None, str]:
+    cur_campaign_id = str(current.get("campaign_id", "")).strip()
+    cur_goal = str(current.get("goal", "")).strip()
+    try:
+        cur_runs = int(current.get("runs", 0))
+    except Exception:
+        cur_runs = 0
+    cur_bucket = _metrics_scale_bucket(cur_runs)
+
+    candidates = [
+        item
+        for item in history
+        if isinstance(item, dict)
+        and str(item.get("campaign_id", "")).strip()
+        and str(item.get("campaign_id", "")).strip() != cur_campaign_id
+    ]
+    if not candidates:
+        return None, "no history baseline available"
+
+    same_goal = [item for item in candidates if str(item.get("goal", "")).strip() == cur_goal]
+    scoped = same_goal if same_goal else candidates
+    scope_reason = "same-goal history" if same_goal else "cross-goal history"
+
+    bucket_candidates = []
+    for item in scoped:
+        try:
+            runs = int(item.get("runs", 0))
+        except Exception:
+            runs = 0
+        if _metrics_scale_bucket(runs) == cur_bucket:
+            bucket_candidates.append(item)
+
+    if bucket_candidates:
+        exact = []
+        for item in bucket_candidates:
+            try:
+                runs = int(item.get("runs", 0))
+            except Exception:
+                runs = 0
+            if runs == cur_runs:
+                exact.append(item)
+        if exact:
+            return exact[-1], f"{scope_reason}; exact runs={cur_runs}"
+        nearest = _choose_nearest_runs_baseline(bucket_candidates, cur_runs)
+        if nearest is not None:
+            return nearest, f"{scope_reason}; same scale bucket={cur_bucket} by nearest runs"
+
+    nearest_scoped = _choose_nearest_runs_baseline(scoped, cur_runs)
+    if nearest_scoped is not None:
+        return nearest_scoped, f"{scope_reason}; nearest runs fallback"
+    return None, "no comparable baseline found"
 
 
 def _build_campaign_metrics(
@@ -546,6 +649,7 @@ def iterate_goal(
     summary_path = wf_root / "memory" / "autopilot_latest.json"
     metrics_path = wf_root / "memory" / "autopilot_metrics_latest.json"
     metrics_diff_path = wf_root / "memory" / "autopilot_metrics_diff_latest.json"
+    metrics_history_path = wf_root / "memory" / "autopilot_metrics_history.jsonl"
     previous_metrics: Dict[str, object] = {}
     if metrics_path.exists():
         previous_metrics = load_json(metrics_path)
@@ -637,7 +741,17 @@ def iterate_goal(
 
     metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports)
     dump_json(metrics_path, metrics)
-    if previous_metrics:
-        metrics_diff = _build_metrics_diff(previous_metrics, metrics)
+    history_records = _load_jsonl_records(metrics_history_path)
+    append_jsonl(metrics_history_path, metrics)
+
+    baseline, baseline_reason = _select_metrics_baseline(history_records, metrics)
+    if baseline is None and previous_metrics:
+        baseline = previous_metrics
+        baseline_reason = "fallback to previous latest metrics snapshot"
+
+    if baseline:
+        metrics_diff = _build_metrics_diff(baseline, metrics)
+        metrics_diff["baseline_reason"] = baseline_reason
+        metrics_diff["baseline_runs"] = int(baseline.get("runs", 0) or 0)
         dump_json(metrics_diff_path, metrics_diff)
     return summary_path
