@@ -421,23 +421,41 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
     if not history:
         return defaults, ["adaptive policy: no history, use defaults"]
 
-    recent = [item for item in history if isinstance(item, dict)][-5:]
+    real_history = [item for item in history if isinstance(item, dict) and not bool(item.get("dry_run", False))]
+    source = "real-history"
+    if real_history:
+        recent = real_history[-5:]
+    else:
+        recent = [item for item in history if isinstance(item, dict)][-5:]
+        source = "mixed-history"
     if not recent:
         return defaults, ["adaptive policy: empty recent history, use defaults"]
 
     timeout_rates: List[float] = []
     degraded_rates: List[float] = []
+    strict_rates: List[float] = []
     for item in recent:
         timeout_rates.append(_compute_timeout_rate(item))
         try:
             degraded_rates.append(float(item.get("degraded_run_rate", 0.0)))
         except Exception:
             degraded_rates.append(0.0)
+        try:
+            if "strict_success_rate" in item:
+                strict_rates.append(float(item.get("strict_success_rate", 0.0)))
+            else:
+                strict_rates.append(max(0.0, float(item.get("success_rate", 0.0)) - float(item.get("degraded_run_rate", 0.0))))
+        except Exception:
+            strict_rates.append(0.0)
 
     avg_timeout = sum(timeout_rates) / len(timeout_rates)
     avg_degraded = sum(degraded_rates) / len(degraded_rates)
+    avg_strict = sum(strict_rates) / len(strict_rates)
 
-    if avg_timeout >= 0.75:
+    if avg_timeout >= 0.50 and avg_strict < 0.20:
+        codex_timeout_threshold = 2
+        codex_cooldown_rounds = 4
+    elif avg_timeout >= 0.75:
         codex_timeout_threshold = 2
         codex_cooldown_rounds = 3
     elif avg_timeout >= 0.45:
@@ -466,7 +484,8 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
     actions = [
         (
             "adaptive policy from recent campaigns: "
-            f"avg_timeout_rate={avg_timeout:.3f}, avg_degraded_rate={avg_degraded:.3f}, "
+            f"source={source}, avg_timeout_rate={avg_timeout:.3f}, avg_degraded_rate={avg_degraded:.3f}, "
+            f"avg_strict_success_rate={avg_strict:.3f}, "
             f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
             f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}"
         )
@@ -510,6 +529,7 @@ def _select_metrics_baseline(
 ) -> Tuple[Dict[str, object] | None, str]:
     cur_campaign_id = str(current.get("campaign_id", "")).strip()
     cur_goal = str(current.get("goal", "")).strip()
+    cur_dry_run = bool(current.get("dry_run", False))
     try:
         cur_runs = int(current.get("runs", 0))
     except Exception:
@@ -525,6 +545,10 @@ def _select_metrics_baseline(
     ]
     if not candidates:
         return None, "no history baseline available"
+
+    mode_candidates = [item for item in candidates if bool(item.get("dry_run", False)) == cur_dry_run]
+    if mode_candidates:
+        candidates = mode_candidates
 
     same_goal = [item for item in candidates if str(item.get("goal", "")).strip() == cur_goal]
     scoped = same_goal if same_goal else candidates
@@ -564,6 +588,7 @@ def _build_campaign_metrics(
     goal: str,
     campaign_id: str,
     report_paths: List[Path],
+    dry_run: bool,
 ) -> Dict[str, object]:
     totals = {
         "runs": 0,
@@ -652,6 +677,7 @@ def _build_campaign_metrics(
         "ts": _utc_now(),
         "goal": goal,
         "campaign_id": campaign_id,
+        "dry_run": bool(dry_run),
         "runs": totals["runs"],
         "success_runs": totals["success_runs"],
         "strict_success_runs": totals["strict_success_runs"],
@@ -1072,7 +1098,7 @@ def iterate_goal(
     }
     dump_json(summary_path, summary)
 
-    metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports)
+    metrics = _build_campaign_metrics(goal=goal, campaign_id=campaign_id, report_paths=campaign_reports, dry_run=dry_run)
     dump_json(metrics_path, metrics)
     summary["strict_success_count"] = int(metrics.get("strict_success_runs", 0) or 0)
     summary["strict_success_rate"] = float(metrics.get("strict_success_rate", 0.0) or 0.0)
