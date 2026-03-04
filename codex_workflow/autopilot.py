@@ -1140,6 +1140,17 @@ def iterate_goal(
         if crew_unavailable:
             crew_blocked = True
 
+        if codex_timeout and int(state.get("codex_timeout_threshold", 3)) > 1:
+            state["codex_timeout_threshold"] = 1
+            state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
+            post_actions.append("fast-tightened codex timeout policy after immediate timeout")
+            if not timeout_seconds_overridden_by_env:
+                if int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180")) > 5:
+                    os.environ["CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS"] = "5"
+                    post_actions.append(
+                        "fast-tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 after immediate timeout"
+                    )
+
         if idx >= 2:
             live_timeout_rate = codex_timeout_events / idx
             if live_timeout_rate >= 0.35 and int(state.get("codex_timeout_threshold", 3)) > 1:
