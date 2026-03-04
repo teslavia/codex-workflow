@@ -297,8 +297,18 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
             continue
         if stage.get("status") not in {"failed", "degraded"}:
             continue
+        message = str(stage.get("message", "")).lower()
+        if "model block cache" in message:
+            return True
+        cmd_results = stage.get("command_results", [])
+        if isinstance(cmd_results, list):
+            for cmd in cmd_results:
+                if not isinstance(cmd, dict):
+                    continue
+                if int(cmd.get("return_code", 0)) == 2:
+                    return True
 
-        for cmd in stage.get("command_results", []):
+        for cmd in cmd_results:
             if not isinstance(cmd, dict):
                 continue
             log_path = cmd.get("log_path")
@@ -311,6 +321,47 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
                 continue
             content = path.read_text(encoding="utf-8", errors="ignore").lower()
             if "your request was blocked" in content or "request was blocked" in content:
+                return True
+    return False
+
+
+def _is_crewai_unavailable(repo_root: Path, report: Dict[str, object]) -> bool:
+    stages = report.get("stages", [])
+    if not isinstance(stages, list):
+        return False
+
+    patterns = [
+        "crewai is not installed",
+        "install with: pip install '.[crewai]'",
+        "current python is unsupported",
+    ]
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        if stage.get("kind") != "crewai":
+            continue
+        if stage.get("status") not in {"failed", "degraded"}:
+            continue
+        message = str(stage.get("message", "")).lower()
+        if any(item in message for item in patterns):
+            return True
+
+        cmd_results = stage.get("command_results", [])
+        if not isinstance(cmd_results, list):
+            continue
+        for cmd in cmd_results:
+            if not isinstance(cmd, dict):
+                continue
+            log_path = cmd.get("log_path")
+            if not isinstance(log_path, str) or not log_path:
+                continue
+            path = Path(log_path)
+            if not path.is_absolute():
+                path = repo_root / path
+            if not path.exists():
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore").lower()
+            if any(item in content for item in patterns):
                 return True
     return False
 
@@ -417,6 +468,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         "crew_cooldown_rounds": 5,
         "codex_timeout_threshold": 3,
         "codex_cooldown_rounds": 4,
+        "codex_timeout_seconds": 12,
     }
     if not history:
         return defaults, ["adaptive policy: no history, use defaults"]
@@ -471,19 +523,26 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         avg_strict = strict_weighted / weight_total
 
     if avg_timeout >= 0.50 and avg_strict <= 0.20:
-        codex_timeout_threshold = 2
-        codex_cooldown_rounds = 4
+        codex_timeout_threshold = 1
+        codex_cooldown_rounds = 5
+        codex_timeout_seconds = 5
     elif avg_timeout >= 0.75:
         codex_timeout_threshold = 2
-        codex_cooldown_rounds = 3
+        codex_cooldown_rounds = 4
+        codex_timeout_seconds = 6
     elif avg_timeout >= 0.45:
         codex_timeout_threshold = 3
         codex_cooldown_rounds = 3
+        codex_timeout_seconds = 8
     else:
         codex_timeout_threshold = 4
         codex_cooldown_rounds = 2
+        codex_timeout_seconds = 12
 
-    if avg_degraded >= 0.80:
+    if avg_degraded >= 0.90 and avg_strict <= 0.10:
+        crew_blocked_threshold = 1
+        crew_cooldown_rounds = 8
+    elif avg_degraded >= 0.80:
         crew_blocked_threshold = 2
         crew_cooldown_rounds = 6
     elif avg_degraded >= 0.50:
@@ -498,6 +557,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         "crew_cooldown_rounds": crew_cooldown_rounds,
         "codex_timeout_threshold": codex_timeout_threshold,
         "codex_cooldown_rounds": codex_cooldown_rounds,
+        "codex_timeout_seconds": codex_timeout_seconds,
     }
     actions = [
         (
@@ -506,7 +566,8 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
             f"avg_degraded_rate={avg_degraded:.3f}, "
             f"avg_strict_success_rate={avg_strict:.3f}, "
             f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
-            f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}"
+            f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}, "
+            f"codex_timeout_seconds={codex_timeout_seconds}"
         )
     ]
     return policy, actions
@@ -968,6 +1029,8 @@ def iterate_goal(
     if len(history_records) != len(raw_history_records):
         _rewrite_jsonl_records(metrics_history_path, history_records)
     adaptive_policy, adaptive_actions = _derive_adaptive_policy(history_records)
+    codex_timeout_events = 0
+    timeout_seconds_overridden_by_env = "CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS" in os.environ
     try:
         blocked_threshold = int(os.getenv("CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD", "3"))
     except ValueError:
@@ -984,6 +1047,10 @@ def iterate_goal(
         codex_cooldown_rounds = int(os.getenv("CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS", "4"))
     except ValueError:
         codex_cooldown_rounds = 4
+    try:
+        codex_timeout_seconds = int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180"))
+    except ValueError:
+        codex_timeout_seconds = 180
 
     if "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" not in os.environ:
         blocked_threshold = int(adaptive_policy.get("crew_blocked_threshold", blocked_threshold))
@@ -993,11 +1060,14 @@ def iterate_goal(
         codex_timeout_threshold = int(adaptive_policy.get("codex_timeout_threshold", codex_timeout_threshold))
     if "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS" not in os.environ:
         codex_cooldown_rounds = int(adaptive_policy.get("codex_cooldown_rounds", codex_cooldown_rounds))
+    if not timeout_seconds_overridden_by_env:
+        codex_timeout_seconds = int(adaptive_policy.get("codex_timeout_seconds", codex_timeout_seconds))
 
     state["crew_blocked_threshold"] = max(1, blocked_threshold)
     state["crew_cooldown_rounds"] = max(1, cooldown_rounds)
     state["codex_timeout_threshold"] = max(1, codex_timeout_threshold)
     state["codex_cooldown_rounds"] = max(1, codex_cooldown_rounds)
+    codex_timeout_seconds = max(5, codex_timeout_seconds)
 
     dump_json(
         policy_path,
@@ -1011,16 +1081,23 @@ def iterate_goal(
                 "crew_cooldown_rounds": state["crew_cooldown_rounds"],
                 "codex_timeout_threshold": state["codex_timeout_threshold"],
                 "codex_cooldown_rounds": state["codex_cooldown_rounds"],
+                "codex_timeout_seconds": codex_timeout_seconds,
             },
             "env_overrides": {
                 "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD": "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" in os.environ,
                 "CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS": "CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS" in os.environ,
                 "CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD": "CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD" in os.environ,
                 "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS": "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS" in os.environ,
+                "CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS": "CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS" in os.environ,
             },
         },
     )
     campaign_boot_actions = list(adaptive_actions)
+    if not timeout_seconds_overridden_by_env:
+        os.environ["CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS"] = str(codex_timeout_seconds)
+        campaign_boot_actions.append(
+            f"set runtime CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS={codex_timeout_seconds} from adaptive policy"
+        )
 
     for idx in range(1, iterations + 1):
         pre_actions: List[str] = []
@@ -1049,11 +1126,34 @@ def iterate_goal(
         )
         report = load_json(report_path)
         crew_blocked = _is_crewai_blocked(root, report)
+        crew_unavailable = _is_crewai_unavailable(root, report)
         codex_timeout = _has_codex_timeout(report)
+        if codex_timeout:
+            codex_timeout_events += 1
         if crew_blocked:
             post_actions.append("detected crewai blocked response")
+        if crew_unavailable:
+            post_actions.append("detected crewai runtime unavailable")
         if codex_timeout:
             post_actions.append("detected codex timeout")
+
+        if crew_unavailable:
+            crew_blocked = True
+
+        if idx >= 2:
+            live_timeout_rate = codex_timeout_events / idx
+            if live_timeout_rate >= 0.35 and int(state.get("codex_timeout_threshold", 3)) > 1:
+                state["codex_timeout_threshold"] = 1
+                state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
+                post_actions.append(
+                    "tightened codex timeout policy in-flight due to high live timeout rate"
+                )
+                if not timeout_seconds_overridden_by_env:
+                    if int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180")) > 5:
+                        os.environ["CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS"] = "5"
+                        post_actions.append(
+                            "tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 in-flight"
+                        )
 
         if crew_enabled:
             if crew_blocked:
@@ -1067,6 +1167,13 @@ def iterate_goal(
                 post_actions.append(
                     "entered crewai cooldown after repeated blocked responses"
                 )
+            if crew_unavailable:
+                state["crew_cooldown_remaining"] = max(
+                    int(state.get("crew_cooldown_remaining", 0)),
+                    int(state.get("crew_cooldown_rounds", 5)) + 2,
+                )
+                state["crew_blocked_streak"] = 0
+                post_actions.append("extended crewai cooldown due to missing runtime")
         else:
             state["crew_blocked_streak"] = 0
             state["crew_cooldown_remaining"] = max(0, crew_cooldown_before - 1)
