@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.codex-workflow/runs/
+.codex-workflow/*.lock
+
+._*

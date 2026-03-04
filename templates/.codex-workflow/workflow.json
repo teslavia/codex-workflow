@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "codex": {
+    "enabled": false,
+    "command": "codex exec --prompt-file {prompt_file}",
+    "cwd": "{repo_root}"
+  },
+  "stages": [
+    {
+      "id": "plan",
+      "kind": "codex",
+      "description": "Create implementation plan with risk and test strategy",
+      "prompt_template": "你是资深工程师。目标: {{goal}}\n项目画像: {{project_profile}}\n最近经验: {{recent_lessons}}\n输出: 1)最小改动方案 2)风险点 3)验证命令"
+    },
+    {
+      "id": "implement",
+      "kind": "codex",
+      "description": "Implement minimal diff that satisfies the goal",
+      "prompt_template": "执行目标: {{goal}}\n约束: 最小改动、避免无关重构、保持代码风格一致\n质量门禁: {{quality_gates}}\n最近经验: {{recent_lessons}}\n请完成编码并自检。"
+    },
+    {
+      "id": "verify",
+      "kind": "shell",
+      "description": "Run required quality gates",
+      "command_source": "quality_gates.required",
+      "commands": []
+    },
+    {
+      "id": "review",
+      "kind": "codex",
+      "description": "Perform regression and quality review",
+      "prompt_template": "审查本次任务: {{goal}}\n请输出: 1)风险清单(按严重度) 2)测试缺口 3)是否可合并\n质量门禁: {{quality_gates}}"
+    }
+  ]
+}

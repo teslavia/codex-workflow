@@ -1,0 +1,5 @@
+{
+  "lookback_runs": 30,
+  "min_failure_rate_to_promote": 0.2,
+  "max_lessons_in_prompt": 6
+}

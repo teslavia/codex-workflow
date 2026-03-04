@@ -1,0 +1,16 @@
+{
+  "project_name": "neuroOS",
+  "language_stack": [
+    "C++20",
+    "C11 ABI",
+    "Python"
+  ],
+  "primary_build_system": "cmake",
+  "quality_focus": [
+    "build_stability",
+    "test_regression_control",
+    "api_abi_safety",
+    "minimal_diff"
+  ],
+  "notes": "Keep diffs minimal and always close work with build + targeted tests."
+}

@@ -1,0 +1,22 @@
+{
+  "required": [
+    {
+      "name": "configure",
+      "command": "cmake -B build -DCMAKE_BUILD_TYPE=Release"
+    },
+    {
+      "name": "build",
+      "command": "cmake --build build -j$(sysctl -n hw.ncpu)"
+    },
+    {
+      "name": "tests",
+      "command": "ctest --test-dir build --output-on-failure -j4"
+    }
+  ],
+  "optional": [
+    {
+      "name": "python_api",
+      "command": "python3 -m pytest user/api -q"
+    }
+  ]
+}
