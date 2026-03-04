@@ -346,6 +346,95 @@ def _load_jsonl_records(path: Path) -> List[Dict[str, object]]:
     return records
 
 
+def _compute_timeout_rate(item: Dict[str, object]) -> float:
+    try:
+        runs = int(item.get("runs", 0))
+    except Exception:
+        runs = 0
+    if runs <= 0:
+        return 0.0
+    try:
+        if "timeout_rate" in item:
+            return float(item.get("timeout_rate", 0.0))
+        codex_timeouts = int(item.get("codex_timeout_count", 0))
+    except Exception:
+        codex_timeouts = 0
+    return max(0.0, min(1.0, codex_timeouts / runs))
+
+
+def _compute_campaign_quality_score(success_rate: float, degraded_rate: float, timeout_rate: float) -> float:
+    # 0..100 score prioritizing completion, then stability and latency risk proxy.
+    score = 100.0 * (
+        0.60 * max(0.0, min(1.0, success_rate))
+        + 0.25 * (1.0 - max(0.0, min(1.0, degraded_rate)))
+        + 0.15 * (1.0 - max(0.0, min(1.0, timeout_rate)))
+    )
+    return round(score, 3)
+
+
+def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str, int], List[str]]:
+    defaults = {
+        "crew_blocked_threshold": 3,
+        "crew_cooldown_rounds": 5,
+        "codex_timeout_threshold": 3,
+        "codex_cooldown_rounds": 4,
+    }
+    if not history:
+        return defaults, ["adaptive policy: no history, use defaults"]
+
+    recent = [item for item in history if isinstance(item, dict)][-5:]
+    if not recent:
+        return defaults, ["adaptive policy: empty recent history, use defaults"]
+
+    timeout_rates: List[float] = []
+    degraded_rates: List[float] = []
+    for item in recent:
+        timeout_rates.append(_compute_timeout_rate(item))
+        try:
+            degraded_rates.append(float(item.get("degraded_run_rate", 0.0)))
+        except Exception:
+            degraded_rates.append(0.0)
+
+    avg_timeout = sum(timeout_rates) / len(timeout_rates)
+    avg_degraded = sum(degraded_rates) / len(degraded_rates)
+
+    if avg_timeout >= 0.75:
+        codex_timeout_threshold = 2
+        codex_cooldown_rounds = 3
+    elif avg_timeout >= 0.45:
+        codex_timeout_threshold = 3
+        codex_cooldown_rounds = 3
+    else:
+        codex_timeout_threshold = 4
+        codex_cooldown_rounds = 2
+
+    if avg_degraded >= 0.80:
+        crew_blocked_threshold = 2
+        crew_cooldown_rounds = 6
+    elif avg_degraded >= 0.50:
+        crew_blocked_threshold = 3
+        crew_cooldown_rounds = 5
+    else:
+        crew_blocked_threshold = 4
+        crew_cooldown_rounds = 3
+
+    policy = {
+        "crew_blocked_threshold": crew_blocked_threshold,
+        "crew_cooldown_rounds": crew_cooldown_rounds,
+        "codex_timeout_threshold": codex_timeout_threshold,
+        "codex_cooldown_rounds": codex_cooldown_rounds,
+    }
+    actions = [
+        (
+            "adaptive policy from recent campaigns: "
+            f"avg_timeout_rate={avg_timeout:.3f}, avg_degraded_rate={avg_degraded:.3f}, "
+            f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
+            f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}"
+        )
+    ]
+    return policy, actions
+
+
 def _metrics_scale_bucket(runs: int) -> str:
     if runs <= 3:
         return "micro"
@@ -511,6 +600,8 @@ def _build_campaign_metrics(
 
     success_rate = (totals["success_runs"] / totals["runs"]) if totals["runs"] else 0.0
     degraded_rate = (totals["degraded_stage_runs"] / totals["runs"]) if totals["runs"] else 0.0
+    timeout_rate = (codex_timeout_count / totals["runs"]) if totals["runs"] else 0.0
+    quality_score = _compute_campaign_quality_score(success_rate, degraded_rate, timeout_rate)
     return {
         "ts": _utc_now(),
         "goal": goal,
@@ -521,6 +612,8 @@ def _build_campaign_metrics(
         "success_rate": success_rate,
         "degraded_run_rate": degraded_rate,
         "codex_timeout_count": codex_timeout_count,
+        "timeout_rate": timeout_rate,
+        "quality_score": quality_score,
         "stage_health": stage_health,
         "avg_stage_seconds": avg_stage_seconds,
         "blocked_models_active": blocked_models,
@@ -533,6 +626,30 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
             return float(value)
         except Exception:
             return 0.0
+
+    def _timeout_rate(payload: Dict[str, object]) -> float:
+        if "timeout_rate" in payload:
+            return _num(payload.get("timeout_rate", 0.0))
+        try:
+            runs = int(payload.get("runs", 0))
+        except Exception:
+            runs = 0
+        if runs <= 0:
+            return 0.0
+        try:
+            timeouts = int(payload.get("codex_timeout_count", 0))
+        except Exception:
+            timeouts = 0
+        return max(0.0, min(1.0, timeouts / runs))
+
+    def _quality_score(payload: Dict[str, object]) -> float:
+        if "quality_score" in payload:
+            return _num(payload.get("quality_score", 0.0))
+        return _compute_campaign_quality_score(
+            success_rate=_num(payload.get("success_rate", 0.0)),
+            degraded_rate=_num(payload.get("degraded_run_rate", 0.0)),
+            timeout_rate=_timeout_rate(payload),
+        )
 
     stage_delta: Dict[str, Dict[str, int]] = {}
     current_stage = current.get("stage_health", {})
@@ -569,9 +686,11 @@ def _build_metrics_diff(previous: Dict[str, object], current: Dict[str, object])
             "failed_runs": int(_num(current.get("failed_runs", 0)) - _num(previous.get("failed_runs", 0))),
             "success_rate": _num(current.get("success_rate", 0.0)) - _num(previous.get("success_rate", 0.0)),
             "degraded_run_rate": _num(current.get("degraded_run_rate", 0.0)) - _num(previous.get("degraded_run_rate", 0.0)),
+            "timeout_rate": _timeout_rate(current) - _timeout_rate(previous),
             "codex_timeout_count": int(
                 _num(current.get("codex_timeout_count", 0)) - _num(previous.get("codex_timeout_count", 0))
             ),
+            "quality_score": _quality_score(current) - _quality_score(previous),
         },
         "stage_health_delta": stage_delta,
         "blocked_models_added": sorted(cur_set - prev_set),
@@ -707,6 +826,7 @@ def iterate_goal(
     metrics_path = wf_root / "memory" / "autopilot_metrics_latest.json"
     metrics_diff_path = wf_root / "memory" / "autopilot_metrics_diff_latest.json"
     metrics_history_path = wf_root / "memory" / "autopilot_metrics_history.jsonl"
+    policy_path = wf_root / "memory" / "autopilot_policy_latest.json"
     previous_metrics: Dict[str, object] = {}
     if metrics_path.exists():
         previous_metrics = load_json(metrics_path)
@@ -717,6 +837,8 @@ def iterate_goal(
     campaign_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     campaign_reports: List[Path] = []
     state = _load_autopilot_state(root)
+    history_records = _load_jsonl_records(metrics_history_path)
+    adaptive_policy, adaptive_actions = _derive_adaptive_policy(history_records)
     try:
         blocked_threshold = int(os.getenv("CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD", "3"))
     except ValueError:
@@ -733,14 +855,49 @@ def iterate_goal(
         codex_cooldown_rounds = int(os.getenv("CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS", "4"))
     except ValueError:
         codex_cooldown_rounds = 4
+
+    if "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" not in os.environ:
+        blocked_threshold = int(adaptive_policy.get("crew_blocked_threshold", blocked_threshold))
+    if "CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS" not in os.environ:
+        cooldown_rounds = int(adaptive_policy.get("crew_cooldown_rounds", cooldown_rounds))
+    if "CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD" not in os.environ:
+        codex_timeout_threshold = int(adaptive_policy.get("codex_timeout_threshold", codex_timeout_threshold))
+    if "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS" not in os.environ:
+        codex_cooldown_rounds = int(adaptive_policy.get("codex_cooldown_rounds", codex_cooldown_rounds))
+
     state["crew_blocked_threshold"] = max(1, blocked_threshold)
     state["crew_cooldown_rounds"] = max(1, cooldown_rounds)
     state["codex_timeout_threshold"] = max(1, codex_timeout_threshold)
     state["codex_cooldown_rounds"] = max(1, codex_cooldown_rounds)
 
+    dump_json(
+        policy_path,
+        {
+            "ts": _utc_now(),
+            "goal": goal,
+            "history_window": min(5, len(history_records)),
+            "adaptive_policy": adaptive_policy,
+            "effective_policy": {
+                "crew_blocked_threshold": state["crew_blocked_threshold"],
+                "crew_cooldown_rounds": state["crew_cooldown_rounds"],
+                "codex_timeout_threshold": state["codex_timeout_threshold"],
+                "codex_cooldown_rounds": state["codex_cooldown_rounds"],
+            },
+            "env_overrides": {
+                "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD": "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" in os.environ,
+                "CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS": "CODEX_WORKFLOW_CREWAI_COOLDOWN_ROUNDS" in os.environ,
+                "CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD": "CODEX_WORKFLOW_CODEX_TIMEOUT_THRESHOLD" in os.environ,
+                "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS": "CODEX_WORKFLOW_CODEX_COOLDOWN_ROUNDS" in os.environ,
+            },
+        },
+    )
+    campaign_boot_actions = list(adaptive_actions)
+
     for idx in range(1, iterations + 1):
         pre_actions: List[str] = []
         post_actions: List[str] = []
+        if idx == 1 and campaign_boot_actions:
+            pre_actions.extend(campaign_boot_actions)
         crew_cooldown_before = int(state.get("crew_cooldown_remaining", 0))
         crew_enabled = crew_cooldown_before <= 0
         pre_actions.extend(_set_crewai_stage_enabled(root, enabled=crew_enabled))
