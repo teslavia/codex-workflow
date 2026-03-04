@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -13,6 +15,8 @@ from typing import Dict, List, Tuple
 
 from .models import CommandResult, RunReport, StageConfig, StageResult, WorkflowConfig
 from .utils import append_jsonl, dump_json, load_json
+
+_CREWAI_INTERPRETER_CACHE: Dict[str, str] = {"path": "", "reason": ""}
 
 
 def _utc_now() -> datetime:
@@ -152,6 +156,273 @@ def _is_blocked_error(text: str) -> bool:
     return "request was blocked" in lowered or "your request was blocked" in lowered
 
 
+def _is_crewai_unavailable_error(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "crewai is not installed" in lowered
+        or "install with: pip install '.[crewai]'" in lowered
+        or "current python is unsupported" in lowered
+    )
+
+
+def _toolkit_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _candidate_crewai_interpreters() -> List[str]:
+    env_one = os.getenv("CODEX_WORKFLOW_CREWAI_PYTHON", "").strip()
+    env_many = [item.strip() for item in os.getenv("CODEX_WORKFLOW_CREWAI_PYTHON_CANDIDATES", "").split(",") if item.strip()]
+    toolkit = _toolkit_root()
+    candidates = [
+        env_one,
+        *env_many,
+        str(toolkit / ".venv313" / "bin" / "python"),
+        str(toolkit / ".venv" / "bin" / "python"),
+        sys.executable,
+        shutil.which("python3.13") or "",
+        shutil.which("python3.12") or "",
+        shutil.which("python3.11") or "",
+        shutil.which("python3") or "",
+        shutil.which("python") or "",
+    ]
+    ordered: List[str] = []
+    for item in candidates:
+        path = item.strip() if isinstance(item, str) else ""
+        if not path or path in ordered:
+            continue
+        ordered.append(path)
+    return ordered
+
+
+def _python_can_import_crewai(interpreter: str) -> bool:
+    cmd = [interpreter, "-c", "import crewai"]
+    env = os.environ.copy()
+    toolkit = str(_toolkit_root())
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = toolkit if not existing else (toolkit + os.pathsep + existing)
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=toolkit,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=6,
+            env=env,
+        )
+    except Exception:
+        return False
+    return int(completed.returncode) == 0
+
+
+def _resolve_crewai_interpreter() -> Tuple[str, str]:
+    cached = _CREWAI_INTERPRETER_CACHE.get("path", "").strip()
+    if cached:
+        return cached, _CREWAI_INTERPRETER_CACHE.get("reason", "")
+
+    for candidate in _candidate_crewai_interpreters():
+        if _python_can_import_crewai(candidate):
+            _CREWAI_INTERPRETER_CACHE["path"] = candidate
+            _CREWAI_INTERPRETER_CACHE["reason"] = f"resolved via interpreter probe: {candidate}"
+            return candidate, _CREWAI_INTERPRETER_CACHE["reason"]
+    _CREWAI_INTERPRETER_CACHE["path"] = ""
+    _CREWAI_INTERPRETER_CACHE["reason"] = "no interpreter with importable crewai found"
+    return "", _CREWAI_INTERPRETER_CACHE["reason"]
+
+
+def detect_crewai_runtime_available() -> Tuple[bool, str]:
+    try:
+        from .crewai_blueprint import _require_crewai  # type: ignore[attr-defined]
+
+        _require_crewai()
+        return True, f"in-process runtime via {sys.executable}"
+    except Exception as exc:
+        interpreter, reason = _resolve_crewai_interpreter()
+        if interpreter:
+            return True, reason
+        return False, str(exc) if str(exc).strip() else reason
+
+
+def _run_crewai_stage_subprocess(
+    goal_text: str,
+    log_path: Path,
+    candidates: List[str],
+    blocked_model_names: List[str],
+) -> Tuple[int, Dict[str, object]]:
+    meta: Dict[str, object] = {"attempts": [], "blocked_models": [], "successful_model": ""}
+    interpreter, reason = _resolve_crewai_interpreter()
+    if not interpreter:
+        log_path.write_text(
+            "[crewai_error]\n"
+            f"subprocess runtime unavailable: {reason}\n",
+            encoding="utf-8",
+        )
+        meta["attempts"] = [{"model": "default", "error": reason, "stdout": "", "stderr": ""}]
+        return 1, meta
+
+    runtime_log_path = log_path.parent / f"{log_path.stem}.runtime.json"
+    payload = {
+        "goal": goal_text,
+        "candidates": candidates,
+        "blocked_model_names": blocked_model_names,
+        "log_path": str(log_path),
+        "meta_path": str(runtime_log_path),
+    }
+    env = os.environ.copy()
+    toolkit = str(_toolkit_root())
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = toolkit if not existing else (toolkit + os.pathsep + existing)
+    env["CODEX_WORKFLOW_CREWAI_SUBPROCESS_PAYLOAD"] = json.dumps(payload, ensure_ascii=False)
+
+    script = r"""
+import json
+import os
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
+
+from codex_workflow.crewai_blueprint import build_default_crew, resolve_codex_llm_runtime
+
+def _blocked(text: str) -> bool:
+    lowered = text.lower()
+    return "request was blocked" in lowered or "your request was blocked" in lowered
+
+payload = json.loads(os.environ["CODEX_WORKFLOW_CREWAI_SUBPROCESS_PAYLOAD"])
+goal = str(payload.get("goal", ""))
+candidates = payload.get("candidates", [])
+if not isinstance(candidates, list):
+    candidates = []
+blocked_names = payload.get("blocked_model_names", [])
+if not isinstance(blocked_names, list):
+    blocked_names = []
+log_path = Path(str(payload.get("log_path", "")))
+meta_path = Path(str(payload.get("meta_path", "")))
+
+runtime = resolve_codex_llm_runtime(apply_env=False)
+runtime_model = runtime.get("model")
+full_candidates = [str(item).strip() for item in candidates if str(item).strip()]
+if isinstance(runtime_model, str) and runtime_model.strip() and runtime_model not in full_candidates:
+    full_candidates.insert(0, runtime_model)
+blocked_set = {str(item).strip() for item in blocked_names if str(item).strip()}
+if blocked_set:
+    full_candidates = [item for item in full_candidates if item not in blocked_set]
+
+meta = {"attempts": [], "blocked_models": [], "successful_model": ""}
+if not full_candidates:
+    log_path.write_text(
+        "[crewai_error]\n"
+        "no model candidates available (all candidates currently blocked by cache)\n",
+        encoding="utf-8",
+    )
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    raise SystemExit(2)
+
+attempts = []
+blocked_models = []
+for model_name in full_candidates:
+    stdout_buffer = StringIO()
+    stderr_buffer = StringIO()
+    try:
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            crew = build_default_crew(goal=goal, model_override=(model_name or None))
+            result = crew.kickoff()
+        log_path.write_text(
+            "[crewai_runtime]\n"
+            f"{json.dumps(runtime, ensure_ascii=False)}\n\n"
+            "[crewai_model]\n"
+            f"{model_name or 'default'}\n\n"
+            "[crewai_result]\n"
+            f"{result}\n\n"
+            "[crewai_stdout]\n"
+            f"{stdout_buffer.getvalue()}\n"
+            "[crewai_stderr]\n"
+            f"{stderr_buffer.getvalue()}\n",
+            encoding="utf-8",
+        )
+        meta = {"attempts": attempts, "blocked_models": blocked_models, "successful_model": model_name or "default"}
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        raise SystemExit(0)
+    except Exception as exc:
+        err_text = str(exc)
+        out_text = stdout_buffer.getvalue()
+        err_buf = stderr_buffer.getvalue()
+        if _blocked(err_text) or _blocked(out_text) or _blocked(err_buf):
+            blocked_models.append(model_name or "default")
+        attempts.append(
+            {
+                "model": model_name or "default",
+                "error": err_text,
+                "stdout": out_text,
+                "stderr": err_buf,
+            }
+        )
+
+log_path.write_text(
+    "[crewai_error]\n"
+    "all model attempts failed\n\n"
+    "[crewai_attempts]\n"
+    f"{json.dumps(attempts, ensure_ascii=False, indent=2)}\n",
+    encoding="utf-8",
+)
+meta = {"attempts": attempts, "blocked_models": blocked_models, "successful_model": ""}
+meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+raise SystemExit(1)
+"""
+
+    try:
+        completed = subprocess.run(
+            [interpreter, "-c", script],
+            cwd=toolkit,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(15, int(os.getenv("CODEX_WORKFLOW_CREWAI_SUBPROCESS_TIMEOUT_SECONDS", "120"))),
+            env=env,
+        )
+        return_code = int(completed.returncode)
+    except Exception as exc:
+        log_path.write_text(
+            "[crewai_error]\n"
+            f"failed to execute crewai subprocess ({interpreter}): {exc}\n",
+            encoding="utf-8",
+        )
+        meta["attempts"] = [{"model": "default", "error": str(exc), "stdout": "", "stderr": ""}]
+        return 1, meta
+
+    if runtime_log_path.exists():
+        try:
+            raw = json.loads(runtime_log_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                meta = raw
+        except Exception:
+            pass
+
+    if return_code not in {0, 1, 2}:
+        if log_path.exists():
+            base_log = log_path.read_text(encoding="utf-8", errors="ignore")
+        else:
+            base_log = ""
+        with log_path.open("w", encoding="utf-8") as f:
+            f.write(base_log)
+            if base_log and not base_log.endswith("\n"):
+                f.write("\n")
+            f.write("\n[crewai_subprocess]\n")
+            f.write(f"interpreter={interpreter}\n")
+            f.write(f"return_code={return_code}\n")
+            if completed.stdout:
+                f.write("[stdout]\n")
+                f.write(completed.stdout)
+                if not completed.stdout.endswith("\n"):
+                    f.write("\n")
+            if completed.stderr:
+                f.write("[stderr]\n")
+                f.write(completed.stderr)
+                if not completed.stderr.endswith("\n"):
+                    f.write("\n")
+        return_code = 1
+    return return_code, meta
+
+
 def _run_crewai_stage(
     goal_text: str,
     log_path: Path,
@@ -159,8 +430,11 @@ def _run_crewai_stage(
     blocked_model_names: List[str],
 ) -> Tuple[int, Dict[str, object]]:
     meta: Dict[str, object] = {"attempts": [], "blocked_models": [], "successful_model": ""}
+    local_runtime_available = True
     try:
-        from .crewai_blueprint import build_default_crew, resolve_codex_llm_runtime
+        from .crewai_blueprint import _require_crewai, build_default_crew, resolve_codex_llm_runtime
+
+        _require_crewai()
 
         os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
         os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
@@ -234,13 +508,34 @@ def _run_crewai_stage(
         meta["attempts"] = attempts
         meta["blocked_models"] = blocked_models
         meta["successful_model"] = ""
+        unavailable_errors = [
+            attempt for attempt in attempts if _is_crewai_unavailable_error(str(attempt.get("error", "")))
+        ]
+        if attempts and len(unavailable_errors) == len(attempts):
+            return _run_crewai_stage_subprocess(
+                goal_text=goal_text,
+                log_path=log_path,
+                candidates=candidates,
+                blocked_model_names=blocked_model_names,
+            )
         return 1, meta
     except Exception as exc:  # pragma: no cover - external dependency/runtime config
-        log_path.write_text(f"[crewai_error]\n{exc}\n", encoding="utf-8")
-        meta["attempts"] = [{"model": "default", "error": str(exc), "stdout": "", "stderr": ""}]
-        meta["blocked_models"] = []
-        meta["successful_model"] = ""
-        return 1, meta
+        local_runtime_available = False
+        if not _is_crewai_unavailable_error(str(exc)):
+            log_path.write_text(f"[crewai_error]\n{exc}\n", encoding="utf-8")
+            meta["attempts"] = [{"model": "default", "error": str(exc), "stdout": "", "stderr": ""}]
+            meta["blocked_models"] = []
+            meta["successful_model"] = ""
+            return 1, meta
+
+    if not local_runtime_available:
+        return _run_crewai_stage_subprocess(
+            goal_text=goal_text,
+            log_path=log_path,
+            candidates=candidates,
+            blocked_model_names=blocked_model_names,
+        )
+    return 1, meta
 
 
 def _update_model_cache(
@@ -548,6 +843,15 @@ def run_workflow(
             else:
                 fallback_raw = os.getenv("CODEX_WORKFLOW_CREWAI_FALLBACK_MODELS", "")
                 fallback_models = [item.strip() for item in fallback_raw.split(",") if item.strip()]
+                try:
+                    from .crewai_blueprint import resolve_codex_llm_runtime
+
+                    runtime = resolve_codex_llm_runtime(apply_env=False)
+                    runtime_model = runtime.get("model", "")
+                    if isinstance(runtime_model, str) and runtime_model.strip() and runtime_model not in fallback_models:
+                        fallback_models.insert(0, runtime_model)
+                except Exception:
+                    pass
                 now_ts = time.time()
                 try:
                     probe_window_minutes = int(os.getenv("CODEX_WORKFLOW_MODEL_PROBE_WINDOW_MINUTES", "0"))
@@ -617,10 +921,11 @@ def run_workflow(
                 )
             if return_code != 0:
                 if stage.continue_on_error:
-                    stage_status = "degraded"
                     if return_code == 2:
+                        stage_status = "skipped"
                         stage_message = "crewai stage skipped by model block cache (non-blocking)"
                     else:
+                        stage_status = "degraded"
                         stage_message = "crewai stage failed (non-blocking)"
                 else:
                     stage_status = "failed"

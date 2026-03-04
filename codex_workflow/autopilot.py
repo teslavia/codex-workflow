@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from .bootstrap import bootstrap
 from .evolution import evolve
-from .runner import run_workflow
+from .runner import detect_crewai_runtime_available, run_workflow
 from .utils import append_jsonl, dump_json, load_json
 
 
@@ -295,7 +295,7 @@ def _is_crewai_blocked(repo_root: Path, report: Dict[str, object]) -> bool:
             continue
         if stage.get("kind") != "crewai":
             continue
-        if stage.get("status") not in {"failed", "degraded"}:
+        if stage.get("status") not in {"failed", "degraded", "skipped"}:
             continue
         message = str(stage.get("message", "")).lower()
         if "model block cache" in message:
@@ -367,13 +367,8 @@ def _is_crewai_unavailable(repo_root: Path, report: Dict[str, object]) -> bool:
 
 
 def _crewai_runtime_preflight() -> Tuple[bool, str]:
-    try:
-        from .crewai_blueprint import _require_crewai  # type: ignore[attr-defined]
-
-        _require_crewai()
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
+    ok, reason = detect_crewai_runtime_available()
+    return ok, reason
 
 
 def _has_codex_timeout(report: Dict[str, object]) -> bool:
@@ -496,6 +491,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         "codex_cooldown_rounds": 4,
         "codex_timeout_seconds": 12,
         "codex_probe_when_crewai_unavailable": True,
+        "codex_lock_remaining_on_timeout": True,
     }
     if not history:
         return defaults, ["adaptive policy: no history, use defaults"]
@@ -513,6 +509,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
     timeout_weighted = 0.0
     degraded_weighted = 0.0
     strict_weighted = 0.0
+    productive_weighted = 0.0
     weight_total = 0.0
     for item in recent:
         try:
@@ -534,20 +531,31 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
                 )
         except Exception:
             strict_value = 0.0
+        try:
+            if "productive_run_rate" in item:
+                productive_value = float(item.get("productive_run_rate", 0.0))
+            else:
+                productive_runs = float(item.get("productive_runs", 0.0))
+                productive_value = (productive_runs / max(1.0, float(runs))) if runs > 0 else 0.0
+        except Exception:
+            productive_value = 0.0
 
         timeout_weighted += timeout_value * weight
         degraded_weighted += degraded_value * weight
         strict_weighted += strict_value * weight
+        productive_weighted += productive_value * weight
         weight_total += weight
 
     if weight_total <= 0:
         avg_timeout = 0.0
         avg_degraded = 0.0
         avg_strict = 0.0
+        avg_productive = 0.0
     else:
         avg_timeout = timeout_weighted / weight_total
         avg_degraded = degraded_weighted / weight_total
         avg_strict = strict_weighted / weight_total
+        avg_productive = productive_weighted / weight_total
 
     if avg_timeout >= 0.50 and avg_strict <= 0.20:
         codex_timeout_threshold = 1
@@ -592,6 +600,46 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         productive_rate=0.0,
     )
     codex_probe_when_crewai_unavailable = expected_probe_capability >= expected_skip_capability
+    codex_lock_remaining_on_timeout = True
+    if avg_productive < 0.35 and avg_timeout <= 0.25:
+        codex_probe_when_crewai_unavailable = True
+        codex_lock_remaining_on_timeout = False
+        codex_timeout_threshold = min(codex_timeout_threshold, 2)
+        codex_cooldown_rounds = min(codex_cooldown_rounds, 3)
+        codex_timeout_seconds = min(codex_timeout_seconds, 8)
+
+    trend_backoff = False
+    if len(recent) >= 2:
+        last = recent[-1]
+        prev = recent[-2]
+        try:
+            last_timeout = _compute_timeout_rate(last)
+            prev_timeout = _compute_timeout_rate(prev)
+            last_cap = float(last.get("capability_score", _compute_capability_score(
+                success_rate=float(last.get("success_rate", 0.0)),
+                degraded_rate=float(last.get("degraded_run_rate", 0.0)),
+                timeout_rate=last_timeout,
+                productive_rate=float(last.get("productive_run_rate", 0.0)),
+            )))
+            prev_cap = float(prev.get("capability_score", _compute_capability_score(
+                success_rate=float(prev.get("success_rate", 0.0)),
+                degraded_rate=float(prev.get("degraded_run_rate", 0.0)),
+                timeout_rate=prev_timeout,
+                productive_rate=float(prev.get("productive_run_rate", 0.0)),
+            )))
+            if (last_timeout - prev_timeout) >= 0.15 and (last_cap - prev_cap) <= -3.0:
+                trend_backoff = True
+        except Exception:
+            trend_backoff = False
+
+    if trend_backoff:
+        codex_lock_remaining_on_timeout = True
+        codex_probe_when_crewai_unavailable = expected_probe_capability >= expected_skip_capability
+        codex_timeout_threshold = min(codex_timeout_threshold, 3)
+        codex_cooldown_rounds = max(codex_cooldown_rounds, 3)
+        actions_note = "applied trend backoff due to timeout rise + capability drop"
+    else:
+        actions_note = ""
 
     policy = {
         "crew_blocked_threshold": crew_blocked_threshold,
@@ -600,6 +648,7 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
         "codex_cooldown_rounds": codex_cooldown_rounds,
         "codex_timeout_seconds": codex_timeout_seconds,
         "codex_probe_when_crewai_unavailable": codex_probe_when_crewai_unavailable,
+        "codex_lock_remaining_on_timeout": codex_lock_remaining_on_timeout,
     }
     actions = [
         (
@@ -607,14 +656,18 @@ def _derive_adaptive_policy(history: List[Dict[str, object]]) -> Tuple[Dict[str,
             f"source={source}, weighted=true, avg_timeout_rate={avg_timeout:.3f}, "
             f"avg_degraded_rate={avg_degraded:.3f}, "
             f"avg_strict_success_rate={avg_strict:.3f}, "
+            f"avg_productive_run_rate={avg_productive:.3f}, "
             f"expected_probe_capability={expected_probe_capability:.3f}, "
             f"expected_skip_capability={expected_skip_capability:.3f}, "
             f"crew_threshold={crew_blocked_threshold}, crew_cooldown={crew_cooldown_rounds}, "
             f"codex_timeout_threshold={codex_timeout_threshold}, codex_cooldown={codex_cooldown_rounds}, "
             f"codex_timeout_seconds={codex_timeout_seconds}, "
-            f"codex_probe_when_crewai_unavailable={policy['codex_probe_when_crewai_unavailable']}"
+            f"codex_probe_when_crewai_unavailable={policy['codex_probe_when_crewai_unavailable']}, "
+            f"codex_lock_remaining_on_timeout={policy['codex_lock_remaining_on_timeout']}"
         )
     ]
+    if actions_note:
+        actions.append(actions_note)
     return policy, actions
 
 
@@ -1150,6 +1203,7 @@ def iterate_goal(
     state["codex_timeout_threshold"] = max(1, codex_timeout_threshold)
     state["codex_cooldown_rounds"] = max(1, codex_cooldown_rounds)
     codex_timeout_seconds = max(5, codex_timeout_seconds)
+    lock_remaining_on_timeout = bool(adaptive_policy.get("codex_lock_remaining_on_timeout", True))
 
     dump_json(
         policy_path,
@@ -1167,6 +1221,7 @@ def iterate_goal(
                 "codex_probe_when_crewai_unavailable": bool(
                     adaptive_policy.get("codex_probe_when_crewai_unavailable", True)
                 ),
+                "codex_lock_remaining_on_timeout": lock_remaining_on_timeout,
             },
             "env_overrides": {
                 "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD": "CODEX_WORKFLOW_CREWAI_BLOCKED_THRESHOLD" in os.environ,
@@ -1244,24 +1299,36 @@ def iterate_goal(
                 post_actions.append("locked crewai for remaining campaign due to missing runtime")
 
         if codex_timeout and int(state.get("codex_timeout_threshold", 3)) > 1:
-            state["codex_timeout_threshold"] = 1
-            state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
-            post_actions.append("fast-tightened codex timeout policy after immediate timeout")
+            if lock_remaining_on_timeout:
+                state["codex_timeout_threshold"] = 1
+                state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
+                post_actions.append("fast-tightened codex timeout policy after immediate timeout")
+            else:
+                state["codex_timeout_threshold"] = max(2, int(state.get("codex_timeout_threshold", 3)))
+                state["codex_cooldown_rounds"] = min(2, max(1, int(state.get("codex_cooldown_rounds", 2))))
+                post_actions.append("light-tightened codex timeout policy after immediate timeout")
             if not timeout_seconds_overridden_by_env:
                 if int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180")) > 5:
                     os.environ["CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS"] = "5"
                     post_actions.append(
-                        "fast-tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 after immediate timeout"
+                        "tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 after immediate timeout"
                     )
 
         if idx >= 2:
             live_timeout_rate = codex_timeout_events / idx
             if live_timeout_rate >= 0.35 and int(state.get("codex_timeout_threshold", 3)) > 1:
-                state["codex_timeout_threshold"] = 1
-                state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
-                post_actions.append(
-                    "tightened codex timeout policy in-flight due to high live timeout rate"
-                )
+                if lock_remaining_on_timeout:
+                    state["codex_timeout_threshold"] = 1
+                    state["codex_cooldown_rounds"] = max(5, int(state.get("codex_cooldown_rounds", 4)))
+                    post_actions.append(
+                        "tightened codex timeout policy in-flight due to high live timeout rate"
+                    )
+                else:
+                    state["codex_timeout_threshold"] = max(2, int(state.get("codex_timeout_threshold", 3)))
+                    state["codex_cooldown_rounds"] = min(2, max(1, int(state.get("codex_cooldown_rounds", 2))))
+                    post_actions.append(
+                        "light-tightened codex timeout policy in-flight due to high live timeout rate"
+                    )
                 if not timeout_seconds_overridden_by_env:
                     if int(os.getenv("CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS", "180")) > 5:
                         os.environ["CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS"] = "5"
@@ -1269,7 +1336,7 @@ def iterate_goal(
                             "tightened CODEX_WORKFLOW_CODEX_TIMEOUT_SECONDS=5 in-flight"
                         )
 
-        if codex_timeout and (crew_unavailable or not crew_enabled):
+        if codex_timeout and (crew_unavailable or not crew_enabled) and lock_remaining_on_timeout:
             lock_codex_remaining = max(0, iterations - idx)
             if lock_codex_remaining > 0:
                 post_actions.append(
